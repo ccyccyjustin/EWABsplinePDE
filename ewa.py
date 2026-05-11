@@ -188,11 +188,13 @@ class EWABSpline(BaseEstimator, RegressorMixin):
 
 
 class EWABSplinePDE(BaseEstimator, RegressorMixin):
-    def __init__(self, deg=3, deriv_coef=[0., 0., 1.], num_int_knots=None,
+    def __init__(self, deg=3, deriv_coef=[0., 0., 1.],
+                 domain=None, num_int_knots=None,
                  sigma=None, gamma_mult=8, prior_type="light",
                  alpha=0.05, log_lamb=(-30, 20), log_lamb_step=0.01, prior_min=1e-10):
         self.deg = deg
         self.deriv_coef = deriv_coef
+        self.domain = domain
         self.num_int_knots = num_int_knots
         self.sigma = sigma
         self.gamma_mult = gamma_mult
@@ -216,7 +218,8 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
         n_samples = X.shape[0]
 
         self.a_, self.b_ = X.min(), X.max()
-        self.domain = (self.a_, self.b_)
+        if self.domain is None:
+            self.domain = (self.a_, self.b_)
 
         # 1. Knot Setup
         if self.num_int_knots is None:
@@ -230,7 +233,7 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
         # 2. Basis & Orthogonalization
         omega = []
         for q, c in enumerate(self.deriv_coef):
-            omega.append(form_omega(*self.domain, self.int_knots_, q, self.deg) * c)
+            omega.append(form_omega(*self.domain, self.int_knots_, deriv_order=q, deg=self.deg) * c)
         omega = np.add.reduce(omega)
 
         B_s = [bs(X[:, i], knots=self.int_knots_, degree=self.deg, intercept=True, boundary_knots=self.domain)
@@ -287,8 +290,8 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
 
         # Optimized SE calculation: avoid full matrix products
         # sqrt(diag(U @ U.T)) is just the row-wise norm
-        variances = np.sum(np.square(U_new), axis=1)
-        se = self.sigma_est * np.sqrt(variances)
+        variances = np.sqrt(np.sum(np.square(U_new), axis=1)) #TODO: CHECK!
+        se = self.sigma_est # * np.sqrt(variances)
         interval = norm.ppf(1 - self.alpha / 2) * se
         preds = pd.DataFrame({'fhat': y_hat, 'se': se,
                              'ci_lower': y_hat - interval, 'ci_upper': y_hat + interval},
@@ -338,42 +341,62 @@ if __name__ == '__main__':
         return ul * np.sin(k * x) / np.sin(k * L)
 
 
-    n = 3000
+    n = 50
     sigma_frac = 0.25
     L = 10
-    k = 5.0
+    k_true = 5.0
     ul = 1
 
-    rng = np.random.default_rng(42)
-    x = np.linspace(0, L, L * n * 100)  # np.sort(rng.uniform(0, L, n))
-    y = true_sol(x, k=k, L=L, ul=ul)
+    x = np.linspace(0, L, L * n * 100)
+    y = true_sol(x, k=k_true, L=L, ul=ul)
     sigma_scaled = np.std(y) * sigma_frac
-    y_noise = y + rng.normal(size=len(x)) * sigma_scaled
-    # print(sigma_scaled)
+    print(sigma_scaled ** 2)
 
-    index_obs = rng.choice(range(len(x)), n)
-    index_obs = np.sort(index_obs)
-    x_obs, y_obs = x[index_obs], y_noise[index_obs]
+    n_iter = 30
+    res = {}
+    for i in range(n_iter):
+        rng = np.random.default_rng(i)
+        y_noise = y + rng.normal(size=len(x)) * sigma_scaled
 
-    deriv_coef = [0, 0, 1.]#[k**2, 0, 1]
-    model = EWABSplinePDE(deriv_coef=deriv_coef)
-    fit = model.fit(x_obs.reshape(-1, 1), y_obs)
-    fit_preds = model.predict(x_obs)
-    fit_preds.plot()
-    mse_train = np.mean((y_obs - fit_preds['fhat']) ** 2)
-    hit_prob = ((fit_preds['ci_lower'] <= y_obs) & (y_obs <= fit_preds['ci_upper'])).mean()
-    print(mse_train, hit_prob)
+        index_obs = rng.choice(range(len(x)), n)
+        index_obs = np.sort(index_obs)
+        x_obs, y_obs = x[index_obs], y_noise[index_obs]
 
-    # TODO: Change CI after adding PDE loss
-    index_test = rng.choice(range(len(x)), n)
-    index_test = np.sort(index_test)
-    x_test, y_test = x[index_test], y_noise[index_test] # TODO: sort
-    preds = model.predict(x_test)
-    mse_test = np.mean((y_test - preds['fhat']) ** 2)
-    hit_prob = ((preds['ci_lower'] <= y_test) & (y_test <= preds['ci_upper'])).mean()
-    # model.plot_fit(show_ci=True, x_test=x_test, y_test=y_test)
+        # TODO: Change CI after adding PDE loss
+        index_test = rng.choice(range(len(x)), n)
+        index_test = np.sort(index_test)
+        x_test, y_test = x[index_test], y_noise[index_test]  # TODO: sort
 
-    print(mse_test, hit_prob)
+        for k_guess in np.linspace(1, 100, 100):
+            deriv_coef = [k_guess**2, 0, 1]
+
+            model = EWABSplinePDE(deriv_coef=deriv_coef, domain=(0, L))
+            fit = model.fit(x_obs.reshape(-1, 1), y_obs)
+            # fit_preds = model.predict(x_obs)
+            # # fit_preds.plot()
+            # mse_train = np.mean((y_obs - fit_preds['fhat']) ** 2)
+            # hit_prob = ((fit_preds['ci_lower'] <= y_obs) & (y_obs <= fit_preds['ci_upper'])).mean()
+            # print(mse_train, hit_prob)
+
+
+            preds = model.predict(x_test)
+            mse_test = np.mean((y_test - preds['fhat']) ** 2)
+            hit_prob = ((preds['ci_lower'] <= y_test) & (y_test <= preds['ci_upper'])).mean()
+            # model.plot_fit(show_ci=True, x_test=x_test, y_test=y_test)
+
+            res[k_guess, i] = np.array([mse_test, hit_prob])
+
+    res = pd.DataFrame(res, index=['mse_test', 'hit_prob']).T
+    res = res.rename_axis(['k_guess', 'iter'])
+    res_mean = res.groupby('k_guess').mean()
+
+    res_mean['mse_test'].plot()
+    plt.axvline(x=k_true, color='k', linestyle='--')
+    plt.show()
+
+    res_mean['hit_prob'].plot()
+    plt.axhline(0.95, color='r', linestyle='--')
+    plt.show()
     # print(preds)
 
     # df = pd.read_csv('~/PDE/EWA/ewa_demo/data.csv', index_col=0)
