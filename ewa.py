@@ -345,30 +345,35 @@ if __name__ == '__main__':
     ul = 1
 
     rng = np.random.default_rng(42)
-    x = np.linspace(0, L, L * 100)  # np.sort(rng.uniform(0, L, n))
+    x = np.linspace(0, L, L * n * 100)  # np.sort(rng.uniform(0, L, n))
     y = true_sol(x, k=k, L=L, ul=ul)
     sigma_scaled = np.std(y) * sigma_frac
     y_noise = y + rng.normal(size=len(x)) * sigma_scaled
-    print(sigma_scaled)
+    # print(sigma_scaled)
 
     index_obs = rng.choice(range(len(x)), n)
     index_obs = np.sort(index_obs)
     x_obs, y_obs = x[index_obs], y_noise[index_obs]
 
-    model = EWABSplinePDE(deriv_coef=[k**2, 0, 1])
+    deriv_coef = [0, 0, 1.]#[k**2, 0, 1]
+    model = EWABSplinePDE(deriv_coef=deriv_coef)
     fit = model.fit(x_obs.reshape(-1, 1), y_obs)
-    print(fit)
+    fit_preds = model.predict(x_obs)
+    fit_preds.plot()
+    mse_train = np.mean((y_obs - fit_preds['fhat']) ** 2)
+    hit_prob = ((fit_preds['ci_lower'] <= y_obs) & (y_obs <= fit_preds['ci_upper'])).mean()
+    print(mse_train, hit_prob)
 
-
+    # TODO: Change CI after adding PDE loss
     index_test = rng.choice(range(len(x)), n)
     index_test = np.sort(index_test)
     x_test, y_test = x[index_test], y_noise[index_test] # TODO: sort
     preds = model.predict(x_test)
     mse_test = np.mean((y_test - preds['fhat']) ** 2)
     hit_prob = ((preds['ci_lower'] <= y_test) & (y_test <= preds['ci_upper'])).mean()
-    model.plot_fit(show_ci=True, x_test=x_test, y_test=y_test)
+    # model.plot_fit(show_ci=True, x_test=x_test, y_test=y_test)
 
-    print(hit_prob, mse_test)
+    print(mse_test, hit_prob)
     # print(preds)
 
     # df = pd.read_csv('~/PDE/EWA/ewa_demo/data.csv', index_col=0)
