@@ -3,6 +3,21 @@ import matplotlib.pyplot as plt
 from scipy.interpolate import splev, splrep
 from scipy.linalg import lstsq
 import scipy.linalg as la
+from joblib import Parallel, delayed
+from tqdm import tqdm
+from scipy.linalg import eigh
+
+
+def parallel(func, iterable, n_jobs=-1, disable_par=False, **kwargs):
+    if disable_par:
+        results = {i: func(i, **kwargs) for i in tqdm(iterable)}
+        return results
+
+    results = Parallel(n_jobs=n_jobs)(
+        delayed(func)(i, **kwargs) for i in tqdm(iterable)
+    )
+    results = {k: v for k, v in zip(iterable, results)}
+    return results
 
 
 def project_to_bspline(y, x, s=0, k=3):
@@ -11,69 +26,233 @@ def project_to_bspline(y, x, s=0, k=3):
     return y_fit
 
 
-def form_omega(a, b, int_knots, deriv_order=2, deg=3):
+import numpy as np
+from scipy.interpolate import BSpline
+
+import numpy as np
+from scipy.interpolate import BSpline
+
+
+def compute_spline_integral_gl(all_knots, u, v, deg, x_eval=None):
     """
-    Computes the roughness penalty matrix Omega using Simpson's rule.
-    Uses the functional scipy.interpolate.splev interface.
+    Optimized vector-constructed calculation of the 1D spline derivative integral.
+    Handles non-uniform knot sequences exactly using vectorized Gauss-Legendre quadrature.
+
+    Parameters:
+    -----------
+    all_knots : array-like
+        The complete knot vector (including padded boundary knots).
+    u, v : int
+        Derivative orders.
+    deg : int
+        Spline polynomial degree.
+    x_eval : array-like, optional
+        Custom evaluation points or interval boundaries. If None, integrates over
+        the entire internal knot domain.
     """
-    q = int(deriv_order)
+    # 1. Setup full padded knot vector
+    n_basis = len(all_knots) - deg - 1
+
+    # 2. Extract unique knot boundaries to identify individual spans
+    internal_knots = all_knots[deg:-deg]
+
+    if x_eval is None:
+        unique_knots = internal_knots
+    else:
+        x_eval = np.asarray(x_eval)
+        # Restrict internal knots to the range of x_eval to avoid creating empty outer spans
+        x_min, x_max = x_eval.min(), x_eval.max()
+        relevant_knots = internal_knots[(internal_knots >= x_min) & (internal_knots <= x_max)]
+
+        # The union ensures we respect both x_eval intervals and spline knot boundaries
+        unique_knots = np.unique(np.concatenate([x_eval, relevant_knots]))
+
+    x_L = unique_knots[:-1]
+    x_R = unique_knots[1:]
+
+    # 3. Generate baseline Gauss-Legendre quadrature points on [-1, 1]
+    n_quad = max(1, deg + 1)
+    quad_x, quad_w = np.polynomial.legendre.leggauss(n_quad)
+
+    # 4. Vectorized scaling transformation to local non-uniform intervals
+    widths = x_R - x_L
+    midpoints = x_R + x_L
+
+    x_pts = 0.5 * widths[:, None] * quad_x[None, :] + 0.5 * midpoints[:, None]
+    w_pts = 0.5 * widths[:, None] * quad_w[None, :]
+
+    # Flatten arrays to perform a single unified evaluation pass
+    x_flat = x_pts.ravel()
+    w_flat = w_pts.ravel()
+
+    # 5. Continuous evaluation of all basis functions simultaneously
+    c = np.eye(n_basis)
+    spl = BSpline(all_knots, c, deg)  # TODO:, extrapolate=False)
+
+    vals_u = spl(x_flat, nu=u)
+    vals_v = vals_u if u == v else spl(x_flat, nu=v)
+
+    # Clean up any NaN limits produced precisely at the right domain boundary 'b'
+    # vals_u = np.nan_to_num(vals_u)
+    # vals_v = np.nan_to_num(vals_v)
+
+    # 6. Contract across the flattened quadrature dimensions
+    omega = np.einsum('k,ki,kj->ij', w_flat, vals_u, vals_v)
+    return omega
+
+def compute_spline_integral_simp(all_knots, u=2, v=2, deg=3):
+    """
+    Computes the integral of the product of the u-th and v-th derivatives
+    of B-spline basis functions: integral[ B_i^(u)(x) * B_j^(v)(x) dx ]
+    """
     p = int(deg)
+    u, v = int(u), int(v)
 
-    if q < 0 or q > p:
-        raise ValueError(f"deriv_order q={q} must satisfy 0 <= q <= deg p={p}")
+    if max(u, v) > p:
+        raise ValueError(f"Derivative orders ({u}, {v}) cannot exceed degree {p}")
 
-    # 1. Construct the full knot vector
-    all_knots = np.r_[np.repeat(a, p + 1), int_knots, np.repeat(b, p + 1)]
+    # 1. Construct full knot vector
     n_basis = len(all_knots) - p - 1
 
-    # 2. Quadrature Setup (Simpson's Rule)
+    # 2. Quadrature Setup (Filter zero-length intervals)
+    # Generate quadrature points and Simpson weights
     intervals = np.diff(all_knots)
-    n_int = len(intervals)
+    xtilde = np.repeat(all_knots[:-1], 3) + np.tile([0, 0.5, 1], len(intervals)) * np.repeat(intervals, 3)
+    wts = np.repeat(intervals, 3) * np.tile([1 / 6, 4 / 6, 1 / 6], len(intervals))
 
-    # Evaluation points (xtilde) and Simpson weights (wts)
-    xtilde = np.repeat(all_knots[:-1], 3) + np.tile([0, 0.5, 1], n_int) * np.repeat(intervals, 3)
-    wts = np.repeat(intervals, 3) * np.tile([1 / 6, 4 / 6, 1 / 6], n_int)
+    # 3. Construct Design Matrices for both derivative orders
+    # Bu: (n_quad_points x n_basis) matrix of u-th derivatives
+    # Bv: (n_quad_points x n_basis) matrix of v-th derivatives
+    Bu = np.zeros((len(xtilde), n_basis))
+    Bv = np.zeros((len(xtilde), n_basis))
 
-    # 3. Construct Design Matrix of Derivatives using splev
-    Bdd = np.zeros((len(xtilde), n_basis))
     for i in range(n_basis):
-        # Create a one-hot coefficient vector for the i-th basis function
         coeffs = np.zeros(n_basis)
         coeffs[i] = 1.0
-        # Evaluate the q-th derivative
-        Bdd[:, i] = splev(xtilde, (all_knots, coeffs, p), der=q) # TODO: Change to PDE Loss
+        tck = (all_knots, coeffs, p)
 
-    # 4. Weighted Inner Product (Omega = Bdd^T * W * Bdd)
-    # This computes integral[ B_i^(q)(x) * B_j^(q)(x) dx ]
-    return (Bdd.T * wts) @ Bdd # TODO: Normalization needed?
+        Bu[:, i] = splev(xtilde, tck, der=u)
+        Bv[:, i] = splev(xtilde, tck, der=v)
+
+    # 4. Weighted Inner Product
+    # Equivalent to: Omega_ij = sum_k [ Bu_ik * Bv_jk * wts_k ]
+    # Using matrix notation: Bu^T @ diag(W) @ Bv
+    Omega_uv = (Bu.T * wts) @ Bv
+    return Omega_uv
+
+# def form_omega(a, b, int_knots, deriv_order=2, deg=3):
+#     """
+#     Computes the roughness penalty matrix Omega using Simpson's rule.
+#     Uses the functional scipy.interpolate.splev interface.
+#     """
+#     q = int(deriv_order)
+#     p = int(deg)
+#
+#     if q < 0 or q > p:
+#         raise ValueError(f"deriv_order q={q} must satisfy 0 <= q <= deg p={p}")
+#
+#     # 1. Construct the full knot vector
+#     all_knots = np.r_[np.repeat(a, p + 1), int_knots, np.repeat(b, p + 1)]
+#     n_basis = len(all_knots) - p - 1
+#
+#     # 2. Quadrature Setup (Simpson's Rule)
+#     intervals = np.diff(all_knots)
+#     n_int = len(intervals)
+#
+#     # Evaluation points (xtilde) and Simpson weights (wts)
+#     xtilde = np.repeat(all_knots[:-1], 3) + np.tile([0, 0.5, 1], n_int) * np.repeat(intervals, 3)
+#     wts = np.repeat(intervals, 3) * np.tile([1 / 6, 4 / 6, 1 / 6], n_int)
+#
+#     # 3. Construct Design Matrix of Derivatives using splev
+#     Bdd = np.zeros((len(xtilde), n_basis))
+#     for i in range(n_basis):
+#         # Create a one-hot coefficient vector for the i-th basis function
+#         coeffs = np.zeros(n_basis)
+#         coeffs[i] = 1.0
+#         # Evaluate the q-th derivative
+#         tck = (all_knots, coeffs, p)
+#         Bdd[:, i] = splev(xtilde, tck, der=q) # TODO: Change to PDE Loss
+#
+#     # 4. Weighted Inner Product (Omega = Bdd^T * W * Bdd)
+#     # This computes integral[ B_i^(q)(x) * B_j^(q)(x) dx ]
+#     return (Bdd.T * wts) @ Bdd # TODO: Normalization needed?
+
+
+def orthogonalize_basis_robust(B, omega, tol=1e-10):
+    """
+    Robust simultaneous diagonalization handling singular/near-singular metric G = B^T @ B.
+    Uses subspace projection to explicitly remove the null space before diagonalizing.
+    """
+    # 1. Form the overlap matrix (Metric)
+    G = B.T @ B
+
+    # 2. Diagonalize G to identify its principal components and null space
+    # Since G is symmetric positive semi-definite, standard eigh is safe
+    evals_G, evecs_G = np.linalg.eigh(G)
+
+    # 3. Filter out the near-singular (unstable) subspace
+    # We scale the tolerance by the largest eigenvalue to make it scale-invariant
+    threshold = tol * np.max(evals_G)
+    valid_mask = evals_G > threshold
+
+    evals_G_r = evals_G[valid_mask]
+    evecs_G_r = evecs_G[:, valid_mask]
+    rank = len(evals_G_r)
+
+    # 4. Construct the whitening transformation matrix (T) for the stable subspace
+    # T projects into a space where the metric is the Identity matrix
+    T = evecs_G_r @ np.diag(1.0 / np.sqrt(evals_G_r))
+
+    # 5. Project the penalty matrix 'omega' into this whitened, well-conditioned subspace
+    omega_proj = T.T @ omega @ T
+
+    # 6. Solve the Standard (not Generalized) Eigenvalue Problem in the projected space
+    s, Z = np.linalg.eigh(omega_proj)
+
+    # 7. Map the eigenvectors back to the original coefficient space
+    V = T @ Z
+
+    # 8. Sort eigenvalues and eigenvectors in descending order
+    idx = np.argsort(s)[::-1]
+    s = np.maximum(s[idx], 0)
+    V = V[:, idx]
+
+    # 9. Construct the orthonormal basis U in the original space
+    U = B @ V
+    return {'U': U, 'V': V, 's': s, 'rank': rank}
 
 def orthogonalize_basis(B, omega):
     """
-    Stable basis orthogonalization. Returns U, V, s such that:
+    Optimized simultaneous diagonalization using Generalized Eigenvalue Decomposition.
     - U = B @ V
     - U.T @ U = Identity
     - V.T @ omega @ V = diag(s)
     """
+    # 1. Form the overlap matrix (Metric) S = B.T @ B
+    # Complexity: O(m * n^2) - This is usually the bottleneck
     G = B.T @ B
+    # L = np.linalg.cholesky(G @ G.T)
+    # print('Stability', np.linalg.det(L))
+
+    # 3. Add regularization to the diagonal of G in-place to save memory
     n_col = G.shape[1]
-    # Small ridge for numerical stability
     eps = np.sqrt(np.finfo(float).eps) * np.trace(G) / n_col
+    np.fill_diagonal(G, G.diagonal() + eps)
 
-    # Cholesky decomposition of Grammian: G = R.T @ R
-    R = la.cholesky(G + eps * np.eye(n_col))
+    # 2. Solve the Generalized Eigenvalue Problem: omega @ V = S @ V @ diag(s)
+    # eigh with 'b' argument returns V such that V.T @ S @ V = I
+    # This automatically satisfies (B @ V).T @ (B @ V) = I
+    s, V = eigh(omega, G)
 
-    # Solve R.T @ M @ R = omega  => M = Rinv.T @ omega @ Rinv
-    # Use solve_triangular for Rinv terms
-    Rinv = la.solve_triangular(R, np.eye(n_col))
-    M = Rinv.T @ omega @ Rinv
+    # 3. Sort eigenvalues in descending order
+    idx = np.argsort(s)[::-1]
+    s = s[idx]
+    V = V[:, idx]
+    s = np.maximum(s, 0)
 
-    # Eigendecomposition of M
-    values, vectors = la.eigh(M)
-    s = np.maximum(values, 0)
-    V = Rinv @ vectors
+    # 4. Construct the orthonormal basis U in the original space
     U = B @ V
-
-    return {"U": U, "V": V, "s": s}
+    return {'U': U, 'V': V, 's': s}
 
 
 def gsj_est(y):
@@ -131,6 +310,8 @@ def fit_ewa_helper(U, y, s, lam_vec, prior, gamma_c, sig2_est):
     2. SURE
     3. weights & EWA
     Highly optimized for large N (rows of U).
+    fhat_ps = U @ ((1.0 / (1.0 + s[:, np.newaxis] * lam_vec[np.newaxis, :])) * (U.T @ y)[:, np.newaxis ])
+    fhat_ewa = fhat_ewa @ weight
     """
     n, p = U.shape
     n_lambda = len(lam_vec)
@@ -164,12 +345,17 @@ def fit_ewa_helper(U, y, s, lam_vec, prior, gamma_c, sig2_est):
         # Combine fitted values using EWA weights: (n, n_lambda) @ (n_lambda,)
         fhat_ewa[:, g] = fhatps @ w
 
+    shrink_weight = (shrinkage_matrix @ weights.T).flatten()
+    A = (U * shrink_weight) @ U.T
+
     return {
         "fhatps": fhatps,
         "lam_used": lam_vec,
         "sure_est": sure_est,
         "weights": weights,
-        "fhat_ewa": fhat_ewa
+        "fhat_ewa": fhat_ewa, # A @ Y_fit
+        'hat_matrix': A,
+        'shrink_weight': shrink_weight
     }
 
 def fit_ewa(y, ftrue, U, V, s, lam, prior, # B_s, a, b, int_knots deg=3, deriv_order=2
@@ -199,9 +385,12 @@ def fit_ewa(y, ftrue, U, V, s, lam, prior, # B_s, a, b, int_knots deg=3, deriv_o
 
     return {
         "mse_est": mse_est, # OK!
-        "fhatps": fit_res['fhatps'], # OK!
         "lam_used": lam, # OK!
         "lam_best": lam_best,  # OK!
-        "sure_est": fit_res['sure_est'], # OK!
         "weights": all_weights_np.flatten(), # OK!
+        **fit_res
+        # "fhatps": fit_res['fhatps'],  # OK!
+        # "sure_est": fit_res['sure_est'],  # OK!
+        # 'D_ewa': fit_res['D_ewa'],
+        # 'hat_matrix': fit_res['hat_matrix']
     }
