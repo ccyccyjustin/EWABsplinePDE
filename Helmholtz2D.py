@@ -67,13 +67,13 @@ if __name__ == '__main__':
         return True if arg == '1' else False
 
     import argparse
-    parser = argparse.ArgumentParser(description="Run Helmholtz PDE")
-    parser.add_argument("-n", "--sample_size", type=int, default=30)
+    parser = argparse.ArgumentParser(description="Run 2D Helmholtz PDE")
+    parser.add_argument("-nf", "--sample_size_frac", type=float, default=1., help='Data to Spline Ratio')
     parser.add_argument("-sf", "--sigma_frac", type=float, default=0.1, help="Noise to Signal Ratio")
 
     parser.add_argument("-a", "--alpha", type=float, default=.05)
     parser.add_argument("-q", "--quantile", type=str, default='0')
-    parser.add_argument("-i", "--iteration", type=int, default=300)
+    parser.add_argument("-i", "--iteration", type=int, default=100)
     parser.add_argument("-s", "--save", type=str, default='1')
     parser.add_argument("-d", "--debug", type=str, default='0')
     parser.add_argument("-w", "--weak_form", type=str, default='0')
@@ -85,7 +85,7 @@ if __name__ == '__main__':
         p_dict['flag'] = p_flag
     args = parser.parse_args()
 
-    n = args.sample_size #1000 # TODO: Slow for large sample size...
+    nf = args.sample_size_frac #1000 # TODO: Slow for large sample size...
     sigma_frac = args.sigma_frac
     alpha = args.alpha
     n_iter = args.iteration
@@ -101,6 +101,12 @@ if __name__ == '__main__':
     # PDE Params
     params = {p_name: args.__getattribute__(p_dict['flag']) for p_name, p_dict in PDE_PARAMS.items()}
 
+    k_sqr = (params['p_m'] ** 2 + params['p_n'] ** 2) * (np.pi ** 2)
+    k = np.sqrt(k_sqr)
+    required_knots_per_dim = int((k / np.pi) * 3)
+    num_int_knots = required_knots_per_dim ** 2
+
+    n = int(num_int_knots * nf)
     grid_size_1d = int(min(X_MAX_SIZE ** (1 / DIM), OVERSAMPLE * n))
     x1 = np.linspace(*DOMAIN[0], grid_size_1d)
     x2 = np.linspace(*DOMAIN[1], grid_size_1d)
@@ -108,11 +114,6 @@ if __name__ == '__main__':
 
     y = true_sol(x, **params)
     sigma_scaled = np.std(y) * sigma_frac
-
-    k_sqr = (params['p_m'] ** 2 + params['p_n'] ** 2) * (np.pi ** 2)
-    k = np.sqrt(k_sqr)
-    required_knots_per_dim = int((k / np.pi) * 3)
-    num_int_knots = required_knots_per_dim ** 2
 
     if action:
         kwargs = ACTION_KWARGS
