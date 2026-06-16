@@ -5,6 +5,9 @@ import matplotlib.pyplot as plt
 import util
 from ewa import EWABSplinePDE
 from util import canberra_similarity, parallel
+from functools import partial
+import inspect
+
 
 X_MAX_SIZE = 1_000_000
 DIM = 2
@@ -41,6 +44,22 @@ PDE_PARAMS = {'p_a':
                    'default': np.pi},
               }
 
+
+def true_sol(x, p_a, p_m, p_n, p_K, p_L, p_H):
+    # Generalized Poisson on [0, L] x [0, H]:
+    # u_xx + a^2 u_yy = g
+    # g(x, y) = K sin(m pi x / L) sin(n pi y / H)
+    # Dirichlet BC: f=0 on dOmega
+    # -> u(x, y) = - (K / m^2 + a^2n^2) [sin (mx) sin (ny)]
+    assert np.ndim(x) == 2 and x.shape[1] == 2
+    m2, n2 = p_m * np.pi / p_L, p_n * np.pi / p_H
+    return - (p_K / (m2 ** 2 + (p_a * n2) ** 2)) * np.sin(m2 * x[:, 0]) * np.sin(n2 * x[:, 1])
+
+
+def force(x, p_m, p_n, p_K, p_L, p_H):
+    assert np.ndim(x) == 2 and x.shape[1] == 2
+    m2, n2 = p_m * np.pi / p_L, p_n * np.pi / p_H
+    return p_K * np.sin(m2 * x[:, 0]) * np.sin(n2 * x[:, 1])
 
 if __name__ == '__main__':
     def to_bool(arg):
@@ -79,15 +98,6 @@ if __name__ == '__main__':
     if debug:
         n_iter = 1
 
-    def true_sol(x, p_a, p_m, p_n, p_K, p_L, p_H):
-        # Generalized Poisson on [0, L] x [0, H]:
-        # u_xx + a^2 u_yy = g
-        # g(x, y) = K sin(m pi x / L) sin(n pi y / H)
-        # Dirichlet BC: f=0 on dOmega
-        # -> u(x, y) = - (K / m^2 + a^2n^2) [sin (mx) sin (ny)]
-        assert np.ndim(x) == 2 and x.shape[1] == 2
-        m2, n2 = p_m * np.pi / p_L, p_n * np.pi / p_H
-        return - (p_K / (m2 ** 2 + (p_a * n2) ** 2)) * np.sin(m2 * x[:, 0]) * np.sin(n2 * x[:, 1])
 
     # take 1d_grid of size (n_sample * oversample)
     grid_size_1d = int(min(X_MAX_SIZE ** (1 / DIM), OVERSAMPLE * n))
@@ -114,12 +124,18 @@ if __name__ == '__main__':
         x_test, y_test, e_test = x[index_test], y_noise[index_test], noise[index_test]  # TODO: sort
         # dataset = pd.DataFrame({'x_train': x_obs, 'y_train': y_obs, 'x_test': x_test, 'y_test': y_test})
 
-        deriv_coef = [1., 0., 1.]
-        trainable = [0]
+        deriv_coef = {'x,x': 1, 'y,y': 9}
+        trainable = ['y,y']
+        variables = ['x', 'y']
 
-        model = EWABSplinePDE(deriv_coef=deriv_coef, domain=[(0, params['p_L']), (0, params['p_H'])],
+        p_force = inspect.signature(force).parameters.keys()
+        force_known = partial(force, **{k: v for k, v in params.items() if k in p_force})
+
+        model = EWABSplinePDE(dim=DIM, deriv_coef=deriv_coef, variables=variables,
+                              force=force_known,
+                              domain=[(0, params['p_L']), (0, params['p_H'])],
                               alpha=alpha, quantile_based=quantile_based,
-                              grid_size=10000, trainable=trainable, norm_omega=False)
+                              total_grid_size=10000, trainable=trainable, norm_omega=False)
         model.fit(x_train, y_train)
 
         def get_metrics(x, y, e):

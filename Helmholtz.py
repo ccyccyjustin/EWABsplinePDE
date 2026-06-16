@@ -3,7 +3,33 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from ewa import EWABSplinePDE
-from util import canberra_similarity, parallel
+from util import canberra_similarity, parallel, tensor_prod
+
+X_MAX_SIZE = 1_000_000
+DIM = 1
+OVERSAMPLE = 100
+
+PDE_PARAMS = {'p_k':
+                  {'flag': 'wavenumber',
+                   'type': float,
+                   'default': 2 * np.pi},
+
+              'p_l':
+                  {'flag': 'boundary',
+                   'type': float,
+                   'default': 1.},
+
+              'p_ul':
+                  {'flag': 'boundary_value',
+                   'type': float,
+                   'default': 1.},
+              }
+
+def true_sol(x, p_k, p_l, p_ul):
+    # Helmholtz:
+    # k^2 u(x) + u''(x) = 0
+    # BC: u(0) = 0, u(l) = ul
+    return p_ul * np.sin(p_k * x) / np.sin(p_k * p_l)
 
 if __name__ == '__main__':
     def to_bool(arg):
@@ -14,21 +40,21 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Run Helmholtz PDE")
     parser.add_argument("-n", "--sample_size", type=int, default=30)
     parser.add_argument("-sf", "--sigma_frac", type=float, default=0.1, help="Noise to Signal Ratio")
-    parser.add_argument("-k", "--wavenumber", type=float, default=2*np.pi)
-    parser.add_argument("-l", "--boundary", type=float, default=1.)
-    parser.add_argument("-ul", "--boundary_value", type=float, default=1.)
+
     parser.add_argument("-a", "--alpha", type=float, default=.05)
     parser.add_argument("-q", "--quantile", type=str, default='0')
     parser.add_argument("-i", "--iteration", type=int, default=300)
     parser.add_argument("-s", "--save", type=str, default='1')
     parser.add_argument("-d", "--debug", type=str, default='0')
+
+    for p_name, p_dict in PDE_PARAMS.items():
+        p_flag = p_dict.pop('flag')
+        parser.add_argument(f"-{p_name}", f"--{p_flag}", **p_dict)
+        p_dict['flag'] = p_flag
     args = parser.parse_args()
 
     n = args.sample_size #1000 # TODO: Slow for large sample size...
     sigma_frac = args.sigma_frac
-    k_true = args.wavenumber
-    l = args.boundary
-    ul = args.boundary_value
     alpha = args.alpha
     n_iter = args.iteration
 
@@ -39,14 +65,13 @@ if __name__ == '__main__':
     if debug:
         n_iter = 1
 
-    def true_sol(x, k, l, ul):
-        # Helmholtz:
-        # k^2 u(x) + u''(x) = 0
-        # BC: u(0) = 0, u(l) = ul
-        return ul * np.sin(k * x) / np.sin(k * l)
+    # PDE Params
+    params = {p_name: args.__getattribute__(p_dict['flag']) for p_name, p_dict in PDE_PARAMS.items()}
 
-    x = np.arange(0, l, 0.01/n) #np.linspace(0, l, l * n * 100)
-    y = true_sol(x, k=k_true, l=l, ul=ul)
+    grid_size_1d = int(min(X_MAX_SIZE ** (1 / DIM), OVERSAMPLE * n))
+    x = np.linspace(0, params['p_l'], grid_size_1d)
+    y = true_sol(x, **params)
+    x = x.reshape(-1, 1)
     sigma_scaled = np.std(y) * sigma_frac
     # print(k_true**2, sigma_scaled)
 
@@ -65,13 +90,15 @@ if __name__ == '__main__':
         x_test, y_test, e_test = x[index_test], y_noise[index_test], noise[index_test]  # TODO: sort
         # dataset = pd.DataFrame({'x_train': x_obs, 'y_train': y_obs, 'x_test': x_test, 'y_test': y_test})
 
-        deriv_coef = [1., 0., 1.]
-        trainable = [0]
+        deriv_coef = {'': 1, 'x': 0, 'x,x': 1}
+        variables = ['x']
+        trainable = None #['', 'x']
 
-        model = EWABSplinePDE(deriv_coef=deriv_coef, domain=[(0, l)],
+        model = EWABSplinePDE(dim=DIM, variables=variables,
+                              deriv_coef=deriv_coef, domain=[(0, params['p_l'])],
                               alpha=alpha, quantile_based=quantile_based,
-                              grid_size=10000, trainable=trainable, norm_omega=False)
-        model.fit(x_train.reshape(-1, 1), y_train)
+                              total_grid_size=10000, trainable=trainable, norm_omega=False)
+        model.fit(x_train, y_train)
 
         def get_metrics(x, y, e):
             preds = model.predict(x)

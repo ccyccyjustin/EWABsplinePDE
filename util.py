@@ -213,10 +213,60 @@ def orthogonalize_basis(B, omega):
     V = V[:, idx]
     s = np.maximum(s, 0)
 
-    # 4. Construct the orthonormal basis U in the original space
-    U = B @ V
-    return {'U': U, 'V': V, 's': s}
+    return {'V': V, 's': s}
 
+def compute_G(B_s):
+    G = B_s.T @ B_s
+    n_col = G.shape[1]
+    eps = np.sqrt(np.finfo(float).eps) * np.trace(G) / n_col
+    np.fill_diagonal(G, G.diagonal() + eps)
+    return G
+
+def orthogonalize_basis_fast(G, omega, k=None, mode='PDE'):
+    """
+    Lets LAPACK handle the GEVP using the precomputed G matrix.
+    This entirely avoids Python-level dense matrix multiplication overhead.
+    """
+
+    # 1. Solve GEVP directly (LAPACK's dsygvd handles Cholesky and symmetry in C/Fortran)
+    if k is not None:
+        N = G.shape[0]
+        subset_by_index = [N - k, N - 1]
+    else:
+        subset_by_index = None
+    s_raw, V = eigh(omega, G, subset_by_index=subset_by_index)
+    if mode == 'ACTION':
+        s = s_raw ** 2
+    else:
+        s = np.maximum(s_raw, 0)
+
+    # 2. Sort eigenvalues and eigenvectors in descending order
+    idx = np.argsort(s)[::-1]
+    s = np.maximum(s[idx], 0)
+    V = V[:, idx]
+
+    # 3. Construct the orthonormal basis U
+    return {'V': V, 's': s}
+
+def orthogonalize_basis_opt(L_inv, omega_std):
+    """
+    Lets LAPACK handle the GEVP using the precomputed G matrix.
+    This entirely avoids Python-level dense matrix multiplication overhead.
+    """
+    import time
+    omega_std = (omega_std + omega_std.T) / 2.0
+    t0 = time.time()
+    s, W = eigh(omega_std)
+    t1 = time.time()
+    print(f'Eigh: {t1-t0}')
+
+    # 2. Sort eigenvalues and eigenvectors in descending order
+    idx = np.argsort(s)[::-1]
+    s = np.maximum(s[idx], 0)
+    V = L_inv.T @ W
+    V = V[:, idx]
+    # 3. Construct the orthonormal basis U
+    return {'V': V, 's': s}
 
 def gsj_est(y):
     """
@@ -265,6 +315,46 @@ def ewa_weights(sure, prior, gamma):
     w = np.exp(log_w)
     return w / np.sum(w)
 
+
+def fit_ewa_spectral(B_ty, sum_y2, V, s, lam_vec, prior, gamma_c, sig2_est):
+    """
+    Ultra-fast Spectral EWA. Executes purely in the K-dimensional orthogonal space.
+    Completely avoids computing U, fhatps, or the N x N Hat Matrix.
+    """
+    # 1. Project y into frequency space: V^T @ (B_s^T @ y)
+    Uty = V.T @ B_ty
+    Uty_sq = Uty ** 2
+
+    # 2. Base RSS (variance orthogonal to the basis)
+    rss_base = max(0.0, sum_y2 - np.sum(Uty_sq))
+
+    # 3. Vectorized SURE calculation across all lambdas
+    shrinkage_matrix = 1.0 / (1.0 + s[:, None] * lam_vec[None, :])
+    shrink_inv = 1.0 - shrinkage_matrix
+
+    rss_j = rss_base + np.sum(Uty_sq[:, None] * (shrink_inv ** 2), axis=0)
+    df_j = np.sum(shrinkage_matrix, axis=0)
+
+    sure_est = rss_j + 2.0 * sig2_est * df_j
+
+    # 4. EWA Weights
+    gamma = gamma_c * sig2_est
+    weights = ewa_weights(sure_est, prior, gamma)
+
+    # 5. Extract optimal coefficients
+    shrink_weight = (shrinkage_matrix @ weights.T).flatten()
+    theta_hat = Uty * shrink_weight
+
+    # The trace of the hat matrix is mathematically exactly the sum of the weights
+    trace_hat = np.sum(shrink_weight)
+
+    return {
+        "lam_best": lam_vec[np.argmax(weights)],
+        "weights": weights,
+        "theta_hat": theta_hat,
+        "shrink_weight": shrink_weight,
+        "trace_hat": trace_hat
+    }
 
 def fit_ewa_helper(U, y_fit, s, lam_vec, prior, gamma_c, sig2_est):
     """
