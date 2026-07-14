@@ -1,184 +1,91 @@
-import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-
-import util
-from ewa import EWABSplinePDE
-from util import canberra_similarity, parallel
-from functools import partial
+from pathlib import Path
 import inspect
+from functools import partial
+from run_example import run_pde_experiment
 
-
+PDE_NAME = Path(__file__).stem
 X_MAX_SIZE = 1_000_000
 DIM = 2
 OVERSAMPLE = 100
+VARIABLES = ['x', 'y']
 
-PDE_PARAMS = {'p_a':
-                  {'flag': 'anisotropy',
-                   'type': float,
-                   'default': 1.},
-
-              'p_K':
-                  {'flag': 'amplitude',
-                   'type': float,
-                   'default': 1.},
-
-              'p_m':
-                  {'flag': 'freq_x',
-                   'type': float,
-                   'default': 1.},
-
-              'p_n':
-                  {'flag': 'freq_y',
-                   'type': float,
-                   'default': 1.},
-
-              'p_L':
-                  {'flag': 'bound_x',
-                   'type': float,
-                   'default': 2 * np.pi},
-
-              'p_H':
-                  {'flag': 'bound_y',
-                   'type': float,
-                   'default': np.pi},
-              }
+# --- Experiment Parameters ---
+PDE_PARAMS = {
+    'p_a': {'flag': 'anisotropy', 'type': float, 'default': 3},
+    'p_K': {'flag': 'amplitude', 'type': float, 'default': 1.},
+    'p_m': {'flag': 'freq_x', 'type': float, 'default': 3.},
+    'p_n': {'flag': 'freq_y', 'type': float, 'default': 4.},
+    'p_L': {'flag': 'bound_x', 'type': float, 'default': 2 * np.pi},
+    'p_H': {'flag': 'bound_y', 'type': float, 'default': np.pi}
+}
 
 
 def true_sol(x, p_a, p_m, p_n, p_K, p_L, p_H):
-    # Generalized Poisson on [0, L] x [0, H]:
-    # u_xx + a^2 u_yy = g
-    # g(x, y) = K sin(m pi x / L) sin(n pi y / H)
-    # Dirichlet BC: f=0 on dOmega
-    # -> u(x, y) = - (K / m^2 + a^2n^2) [sin (mx) sin (ny)]
+    """
+    Generalized Poisson on [0, L] x [0, H]:
+    u_xx + a^2 u_yy = g
+    g(x, y) = K cos(m pi x / L) cos(n pi y / H)
+    Dirichlet BC: du=0 on dOmega
+    """
     assert np.ndim(x) == 2 and x.shape[1] == 2
     m2, n2 = p_m * np.pi / p_L, p_n * np.pi / p_H
-    return - (p_K / (m2 ** 2 + (p_a * n2) ** 2)) * np.sin(m2 * x[:, 0]) * np.sin(n2 * x[:, 1])
+    return - (p_K / (m2 ** 2 + (p_a * n2) ** 2)) * np.cos(m2 * x[:, 0]) * np.cos(n2 * x[:, 1])
 
 
 def force(x, p_m, p_n, p_K, p_L, p_H):
+    """External Forcing Function g(x)"""
     assert np.ndim(x) == 2 and x.shape[1] == 2
     m2, n2 = p_m * np.pi / p_L, p_n * np.pi / p_H
-    return p_K * np.sin(m2 * x[:, 0]) * np.sin(n2 * x[:, 1])
+    return p_K * np.cos(m2 * x[:, 0]) * np.cos(n2 * x[:, 1])
+
+
+def setup_config(params):
+    """
+    Dynamically maps the parsed terminal arguments into the PDE configuration.
+    """
+    domain = [(0, params['p_L']), (0, params['p_H'])]
+
+    # Isolate parameters mapped to the force function and partially apply them
+    p_force = inspect.signature(force).parameters.keys()
+    force_known = partial(force, **{k: v for k, v in params.items() if k in p_force})
+
+    # --- Exact Original Parameter Settings Retained ---
+    PDE_KWARGS = {
+        'deriv_coef': {'x,x': 1, 'y,y': 3},
+        'trainable': ['y,y'],
+        'force': force_known
+    }
+
+    # TODO: ALWAYS PASS NEGATIVE!
+    ACTION_KWARGS = {}
+    action_coef = {
+        ('x', 'x'): -1,  # u_x * u_x
+        ('y', 'y'): -3,  # u_y * u_y
+    }
+    ACTION_KWARGS['action_coef'] = action_coef
+    ACTION_KWARGS['trainable'] = [('y', 'y')] #, ('y', 'y')
+    ACTION_KWARGS['force'] = force_known
+
+    true_params = {'p_a': params['p_a']}
+
+    k_sqr = (params['p_m'] ** 2 + params['p_n'] ** 2) * (np.pi ** 2)
+    k = np.sqrt(k_sqr)
+
+    required_knots_per_dim = int((k / np.pi) * 3)
+    num_int_knots = required_knots_per_dim ** DIM
+    return domain, PDE_KWARGS, ACTION_KWARGS, true_params, num_int_knots
+
 
 if __name__ == '__main__':
-    def to_bool(arg):
-        assert arg in ['0', '1']
-        return True if arg == '1' else False
-
-    import argparse
-    parser = argparse.ArgumentParser(description="Run Helmholtz PDE")
-    parser.add_argument("-n", "--sample_size", type=int, default=30)
-    parser.add_argument("-sf", "--sigma_frac", type=float, default=0.1, help="Noise to Signal Ratio")
-
-    parser.add_argument("-a", "--alpha", type=float, default=.05)
-    parser.add_argument("-q", "--quantile", type=str, default='0')
-    parser.add_argument("-i", "--iteration", type=int, default=300)
-    parser.add_argument("-s", "--save", type=str, default='1')
-    parser.add_argument("-d", "--debug", type=str, default='0')
-
-    for p_name, p_dict in PDE_PARAMS.items():
-        p_flag = p_dict.pop('flag')
-        parser.add_argument(f"-{p_name}", f"--{p_flag}", **p_dict)
-        p_dict['flag'] = p_flag
-    args = parser.parse_args()
-
-    n = args.sample_size #1000 # TODO: Slow for large sample size...
-    sigma_frac = args.sigma_frac
-    alpha = args.alpha
-    n_iter = args.iteration
-
-    save = to_bool(args.save)
-    debug = to_bool(args.debug)
-    quantile_based = to_bool(args.quantile)
-
-    # PDE Params
-    params = {p_name: args.__getattribute__(p_dict['flag']) for p_name, p_dict in PDE_PARAMS.items()}
-
-    if debug:
-        n_iter = 1
-
-
-    # take 1d_grid of size (n_sample * oversample)
-    grid_size_1d = int(min(X_MAX_SIZE ** (1 / DIM), OVERSAMPLE * n))
-
-    x1 = np.linspace(0, params['p_L'], grid_size_1d)
-    x2 = np.linspace(0, params['p_H'], grid_size_1d)
-    x = util.tensor_prod(x1, x2)
-    y = true_sol(x, **params)
-    sigma_scaled = np.std(y) * sigma_frac
-    # print(k_true**2, sigma_scaled)
-
-    def run_one(i):
-        rng = np.random.default_rng(i)
-        noise = rng.normal(size=len(x)) * sigma_scaled
-        y_noise = y + noise
-
-        index_train = rng.choice(range(len(x)), n)
-        index_train = np.sort(index_train)
-        x_train, y_train, e_train = x[index_train], y_noise[index_train], noise[index_train]
-
-        # TODO: Change CI after adding PDE loss
-        index_test = rng.choice(range(len(x)), n)
-        index_test = np.sort(index_test)
-        x_test, y_test, e_test = x[index_test], y_noise[index_test], noise[index_test]  # TODO: sort
-        # dataset = pd.DataFrame({'x_train': x_obs, 'y_train': y_obs, 'x_test': x_test, 'y_test': y_test})
-
-        deriv_coef = {'x,x': 1, 'y,y': 9}
-        trainable = ['y,y']
-        variables = ['x', 'y']
-
-        p_force = inspect.signature(force).parameters.keys()
-        force_known = partial(force, **{k: v for k, v in params.items() if k in p_force})
-
-        model = EWABSplinePDE(dim=DIM, deriv_coef=deriv_coef, variables=variables,
-                              force=force_known,
-                              domain=[(0, params['p_L']), (0, params['p_H'])],
-                              alpha=alpha, quantile_based=quantile_based,
-                              total_grid_size=10000, trainable=trainable, norm_omega=False)
-        model.fit(x_train, y_train)
-
-        def get_metrics(x, y, e):
-            preds = model.predict(x)
-            resid = y - preds['fhat']
-            mse = np.mean(resid ** 2)
-            R2 = canberra_similarity(resid, e) #(resid.T @ e) / (e.T @ e)
-            prob = ((preds['ci_lower'] <= y) & (y <= preds['ci_upper'])).mean()
-            se_max = preds['se'].max() / sigma_scaled
-            return mse, R2, prob, se_max
-
-        mse_train, R2_train, prob_train, sem_train = get_metrics(x_train, y_train, e_train)
-        mse_test, R2_test, prob_test, sem_test = get_metrics(x_test, y_test, e_test)
-
-        res = np.array([mse_train, R2_train, prob_train, sem_train,
-                        mse_test, R2_test, prob_test, sem_test])
-
-        res = pd.Series(res, index=['mse_train', 'R2_train', 'prob_train', 'se_max_train',
-                                    'mse_test', 'R2_test', 'prob_test', 'se_max_test'])
-
-        coef_mean, coef_var = model.coef_mean, model.coef_var
-
-        for i, m_i in enumerate(coef_mean):
-            res[f'coef_mean_{i}'] = m_i
-
-        for (i, j) in np.ndindex(coef_var.shape):
-            res[f'coef_var_{i}_{j}'] = coef_var[i, j]
-
-        if debug:
-            basis_df = model.basis_functions
-            basis_df.plot()
-            plt.show()
-
-            model.plot_fit(show_ci=True, x_test=x_test, y_test=y_test)
-            plt.show()
-            print(res)
-        return res
-
-    res = parallel(run_one, range(n_iter), disable_par=True)
-    res = pd.concat(res, names=['iter'], axis=1).T
-
-    fname='BayesHelmholtz' + str(args).replace('Namespace', ' ') + '.csv'
-
-    if save:
-        res.to_csv(f'/Users/cheungjustin/PDE/EWA/output/{fname}')
-        print(f'{fname} written')
+    # Dispatches the physics definitions to the general testing suite
+    run_pde_experiment(
+        pde_name=PDE_NAME,
+        dim=DIM,
+        variables=VARIABLES,
+        pde_params=PDE_PARAMS,
+        true_sol_func=true_sol,
+        setup_config_func=setup_config,
+        x_max_size=X_MAX_SIZE,
+        oversample=OVERSAMPLE,
+    )

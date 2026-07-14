@@ -5,16 +5,15 @@ from sklearn.base import BaseEstimator, RegressorMixin
 from sklearn.utils.validation import check_X_y, check_array, check_is_fitted
 
 import util
-from util import orthogonalize_basis, gsj_est, fit_ewa, compute_spline_integral_gl, orthogonalize_basis_fast
 import pandas as pd
 from scipy.interpolate import BSpline, CubicSpline
 from scipy.optimize import minimize_scalar, differential_evolution
 import scipy
-import seaborn as sns
-from matplotlib.colors import Normalize, CenteredNorm
-from matplotlib.cm import ScalarMappable
+from typing import Optional, Dict, List, Tuple
+import logging
 
-CMAP = sns.diverging_palette(20, 220, as_cmap=True)
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+logger = logging.getLogger(__name__)
 
 
 def create_knots(x, df=None, knots=None, degree=3, intercept=False, boundary_knots=None):
@@ -102,84 +101,53 @@ def get_deriv_order(deriv_str, variables):
             error_val = int(token) if token.isdigit() else token
             raise ValueError(f'{error_val} not accepted when there are {dim} dimensions with variables {variables}')
 
-    return deriv_splits
+    return tuple(deriv_splits)
+
 
 class EWABSplinePDE(BaseEstimator, RegressorMixin):
-    def __init__(self, dim, deg=3, variables=None,
-                 deriv_coef={}, action_coef={}, force=None, trainable=None,
-                 max_iter=100, min_pct_chg=1e-4,
-                 domain=None, num_int_knots=None, quantile_based=False, total_grid_size=1000,
-                 sigma=None, gamma_mult=8, prior_type="light", norm_omega=False,
-                 alpha=0.05, log_lamb=(-30, 20), log_lamb_step=0.01, tol=1e-10):
-        """
-        :param deg: degree of the 1-d Spline
-        :param deriv_coef: should be a dict: for example u_xx + a^2 u_yy = 0 -> {'0,0': 1, '1,1': a**2}
-        :param trainable: if not provided, assume everything except the highest deriv in 1st variable is trainable.
-        :param max_iter:
-        :param min_pct_chg:
-        :param domain:
-        :param num_int_knots:
-        :param quantile_based:
-        :param total_grid_size:
-        :param sigma:
-        :param gamma_mult:
-        :param prior_type:
-        :param norm_omega:
-        :param alpha:
-        :param log_lamb:
-        :param log_lamb_step:
-        :param tol:
-        """
-        self.deg = deg
+    """
+    Exponentially Weighted Aggregation (EWA) B-Spline Estimator with Physics-Informed Penalties.
+    """
+
+    def __init__(self,
+                 dim: int,
+                 deg: int = 3,
+                 variables: Optional[List[str]] = None,
+                 deriv_coef: Dict[str, float] = None,
+                 action_coef: Dict[tuple, float] = None,
+                 force: callable = None,
+                 trainable: Optional[List[str]] = None,
+                 max_iter: int = 1000,
+                 min_pct_chg: float = 1e-4,
+                 domain: Optional[List[Tuple[float, float]]] = None,
+                 num_int_knots: Optional[int] = None,
+                 quantile_based: bool = False,
+                 total_grid_size: int = 1000,
+                 sigma: Optional[float] = None,
+                 gamma_mult: float = 8.0,
+                 prior_type: str = "light",
+                 norm_omega: bool = False,
+                 alpha: float = 0.05,
+                 log_lamb: Tuple[float, float] = (-30, 20),
+                 log_lamb_step: float = 0.01,
+                 tol: float = 1e-8):
+
         self.dim = dim
+        self.deg = deg
+        self.variables = variables or [str(i) for i in range(dim)]
 
-        if variables is not None:
-            assert len(variables) == dim, "No. Variable does not match dim"
-            self.variables = variables
-        else:
-            self.variables = list(range(dim))
-
-        assert (len(deriv_coef) == 0) or (len(action_coef) == 0)
-        if len(deriv_coef) > 0:
-            deriv_keys = [get_deriv_order(k, self.variables) for k in deriv_coef.keys()]
-            deriv_coef = sorted(zip(deriv_keys, deriv_coef.values()))
-            self.coef_keys, self.deriv_coef_vals = zip(*deriv_coef)
-            self.mode = 'PDE'
-        if len(action_coef) > 0:
-            action_keys = [tuple(get_deriv_order(p, self.variables) for p in pair) for pair in action_coef.keys()]
-            action_coef = sorted(zip(action_keys, action_coef.values()))
-            self.coef_keys, self.action_vals = zip(*action_coef)
-            self.action_vals = np.array(self.action_vals)
-            self.mode = 'ACTION'
-
-        if trainable is not None:
-            trainable_list = []
-            for k in trainable:
-                if isinstance(k, tuple):
-                    k_tuple = tuple(get_deriv_order(ki, self.variables) for ki in k)
-                    trainable_list.append(k_tuple)
-                else:
-                    trainable_list.append(get_deriv_order(k, self.variables))
-            t_str = list(map(str, trainable_list))
-            k_str = list(map(str, self.coef_keys))
-            assert set(t_str) <= set(k_str), "Make sure trainable params are defined in deriv_coef."
-            self.trainable_idx = [i for i, d in enumerate(k_str) if d in t_str]
-        else:
-            deriv_order = list(map(len, self.coef_keys))
-            self.trainable_idx = [i for i, order in enumerate(deriv_order) if order < max(deriv_order)]
-
-        if force is not None:
-            self.force = force
-        else:
-            self.force = lambda s: np.zeros(s.shape[0])
+        self.deriv_coef = deriv_coef or {}
+        self.action_coef = action_coef or {}
+        self.force = force or (lambda s: np.zeros(s.shape[0]))
+        self.trainable = trainable
 
         self.max_iter = max_iter
         self.min_pct_chg = min_pct_chg
-
         self.domain = domain
         self.num_int_knots = num_int_knots
-        self.grid_size = int(total_grid_size ** (1 / self.dim))
         self.quantile_based = quantile_based
+        self.total_grid_size = total_grid_size
+
         self.sigma = sigma
         self.gamma_mult = gamma_mult
         self.prior_type = prior_type
@@ -189,8 +157,72 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
         self.log_lamb_step = log_lamb_step
         self.tol = tol
 
-        self.omega_dict = {}
-        self.integral_1d_cache = {}
+        # Internal Caches
+        self._omega_dict = {}
+        self._integral_1d_cache = {}
+
+    def _parse_physics_configuration(self):
+        """Parses and validates PDE/Action coefficients into internal mathematical formats."""
+        assert not (self.deriv_coef and self.action_coef), "Provide either deriv_coef or action_coef, not both."
+
+        if self.deriv_coef:
+            deriv_keys = [get_deriv_order(k, self.variables) for k in self.deriv_coef.keys()]
+            sorted_coef = sorted(zip(deriv_keys, self.deriv_coef.values()))
+            self._coef_keys, self._initial_coef_vals = zip(*sorted_coef)
+            self.mode = 'PDE'
+        elif self.action_coef:
+            action_keys = [tuple(get_deriv_order(p, self.variables) for p in pair) for pair in
+                           self.action_coef.keys()]
+            sorted_action = sorted(zip(action_keys, self.action_coef.values()))
+            self._coef_keys, self._initial_coef_vals = zip(*sorted_action)
+            self.mode = 'DUAL'
+        else:
+            raise ValueError("Must provide physics constraints via deriv_coef or action_coef.")
+
+        self._initial_coef_vals = np.array(self._initial_coef_vals, dtype=float)
+        self._determine_trainable_indices()
+
+    def parse_derivative_order(self, op_key):
+        """
+        Parses a nonlinear PDE term into a list of derivative order vectors.
+        Example: ((0, 0, 2), (1,2)) -> [ [2, 0, 1], [0, 1, 1] ]
+        """
+        factors = []
+
+        # Handle the base case where the operator is just 'u' (no derivatives)
+        if len(op_key) == 0:
+            return [np.zeros(self.dim, dtype=int)]
+
+        # Wrap single factors so an isolated (0,0,2) becomes ((0,0,2),)
+        if isinstance(op_key[0], int):
+            op_key = (op_key,)
+
+        for term_axes in op_key:
+            order = np.zeros(self.dim, dtype=int)
+            for axis in term_axes:
+                assert axis < self.dim
+                order[axis] += 1
+            factors.append(order)
+
+        return factors
+
+    def _determine_trainable_indices(self):
+        """Determines which physics parameters are actively optimized."""
+        if self.trainable is not None:
+            trainable_list = []
+            for k in self.trainable:
+                if isinstance(k, tuple):
+                    k_tuple = tuple(get_deriv_order(ki, self.variables) for ki in k)
+                    trainable_list.append(k_tuple)
+                else:
+                    trainable_list.append(get_deriv_order(k, self.variables))
+            t_str = list(map(str, trainable_list))
+            k_str = list(map(str, self._coef_keys))
+            assert set(t_str) <= set(k_str), "Make sure trainable params are defined in deriv_coef."
+            self._trainable_idx = [i for i, d in enumerate(k_str) if d in t_str]
+        else:
+            deriv_order = list(map(len, self._coef_keys))
+            self._trainable_idx = [i for i, order in enumerate(deriv_order) if order < max(deriv_order)]
 
     def generate_knots(self, X):
         n_samples = X.shape[0]
@@ -219,6 +251,14 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
         self.n_knots = np.array(list(map(len, self.all_knots)))
         self.knot_counts = knots_data_count(X, self.all_knots, self.deg)
 
+    def get_spline_locations(self, d):
+        """Calculates the Greville Abscissae (knot averages) for the x-axis."""
+        knots = self.all_knots[d]
+        p = self.deg
+        n = self.n_splines[d]
+        # The physical center of the i-th B-spline is the average of its p subsequent knots
+        return np.array([np.mean(knots[i + 1 : i + 1 + p]) for i in range(n)])
+
     def _build_tensor_basis(self, X):
         """Constructs the tensor product of 1D B-splines."""
         B_list = [bs(X[:, i], all_knots=self.all_knots[i], degree=self.deg, intercept=True)
@@ -230,6 +270,74 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
             # Row-wise Kronecker product (Khatri-Rao)
             B_tensor = (B_tensor[:, :, None] * B_list[i][:, None, :]).reshape(X.shape[0], -1)
         return B_tensor
+
+    def _initialize_basis(self, X: np.ndarray):
+        """Generates knots, grids, and projects the design matrix."""
+        self.a_, self.b_ = X.min(axis=0), X.max(axis=0)
+        self.domain_ = self.domain or list(zip(self.a_, self.b_))
+
+        # 1. Generate Knots
+        self.generate_knots(X)  # (Keep your existing robust knot generation logic)
+
+        # 2. Setup Evaluation Grids
+        self.grid_size_ = int(self.total_grid_size ** (1 / self.dim))
+        self.grids_ = [np.linspace(*d, self.grid_size_) for d in self.domain_]
+        self.gridpoints_ = util.tensor_prod(*self.grids_)
+        self.B_grid_ = self._build_tensor_basis(self.gridpoints_)
+
+        # 3. Data Basis & Gram Matrix
+        self.B_data_ = self._build_tensor_basis(X)
+        self.G_ = util.compute_G(self.B_data_)
+
+    def _setup_priors_and_lambda(self, X, y: np.ndarray, tail_clip=0.01):
+        """Constructs the discrete lambda grid and SURE prior distributions."""
+        #self.sigma_est_ = util.gsj_est(y) if self.sigma is None else self.sigma
+        self.sigma_est_ = util.gsj_est_2d_scattered(X, y) if self.sigma is None else self.sigma
+        print(f"Estimated Sigma: {self.sigma_est_}")
+
+        log_lams = np.arange(self.log_lamb[0], self.log_lamb[1], self.log_lamb_step)
+        lam_grid = np.exp(np.sort(log_lams)[::-1])
+
+        if self.prior_type == "light":
+            prior_vals = gamma(a=0.3, scale=1 / 0.3).cdf(lam_grid)
+        else:
+            prior_vals = 2 * t.cdf(25 * lam_grid, df=3) - 1
+
+        prior = np.diff(np.r_[0, prior_vals[::-1]])[::-1]
+        uq, lq = np.argmax(prior_vals <= 1-tail_clip), np.argmax(prior_vals <= tail_clip)
+        r_uq, r_lq = 1 - prior[uq] / tail_clip, 1 - prior[lq] / tail_clip
+        prior[:uq] = prior[uq] * (r_uq ** np.arange(uq))[::-1]
+        prior[lq:] = prior[lq] * (r_lq ** np.arange(len(log_lams) - lq))
+        prior = prior / prior.sum()
+
+        # prior_s = pd.Series(prior, index=lam_grid)
+        # prior_s.plot(logx=True)
+        #TODO: scale with n_sample?
+
+        self.prior_ = prior
+        self.lam_grid_ = lam_grid
+
+    def compute_K_uv(self, d_u, d_v, x_eval=None):
+        K_uv = None
+        for p in range(self.dim):
+            d_up = int((np.array(d_u) == p).sum())
+            d_vp = int((np.array(d_v) == p).sum())
+            # --- 2. Check the Local 1D Micro-Cache ---
+            cache_key_1d = (p, d_up, d_vp)
+            if cache_key_1d not in self._integral_1d_cache:
+                self._integral_1d_cache[cache_key_1d] = util.compute_spline_integral_gl(
+                    self.all_knots[p], u=d_up, v=d_vp, deg=self.deg, x_eval=x_eval
+                )
+
+            K_1d = self._integral_1d_cache[cache_key_1d]
+
+            # --- 3. Assemble the Kronecker Product ---
+            if K_uv is None:
+                K_uv = K_1d
+            else:
+                K_uv = np.kron(K_uv, K_1d)
+        print(f"{d_u, d_v}Computed")
+        return K_uv
 
     def compute_omega(self, deriv_keys, deriv_vals, x_eval=None):
         """
@@ -243,60 +351,28 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
         omega_final = None
 
         for u, c_u in enumerate(deriv_vals):
-            d_u = np.array(deriv_keys[u])
             for v, c_v in enumerate(deriv_vals[:u + 1]):
-                d_v = np.array(deriv_keys[v])
-
-                if (u, v) not in self.omega_dict:
-                    omega_uv = None
-                    for p in range(self.dim):
-                        d_up = (d_u == p).sum()
-                        d_vp = (d_v == p).sum()
-
-                        cache_key_1d = (p, d_up, d_vp)
-                        if cache_key_1d not in self.integral_1d_cache:
-                            self.integral_1d_cache[cache_key_1d] = compute_spline_integral_gl(
-                                self.all_knots[p], u=d_up, v=d_vp, deg=self.deg, x_eval=x_eval
-                            )
-
-                        omega_1d = self.integral_1d_cache[cache_key_1d]
-
-                        if omega_uv is None:
-                            omega_uv = omega_1d
-                        else:
-                            omega_uv = np.kron(omega_uv, omega_1d)
-
-                    self.omega_dict[u, v] = omega_uv
-                    self.omega_dict[v, u] = omega_uv.T
+                if (u, v) not in self._omega_dict:
+                    omega_uv = self.compute_K_uv(deriv_keys[u], deriv_keys[v], x_eval)
+                    self._omega_dict[u, v] = omega_uv
+                    self._omega_dict[v, u] = omega_uv.T
 
                 c = c_u * c_v
                 if omega_final is None:
                     # First allocation: copy the scaled matrix
-                    omega_final = self.omega_dict[u, v] * c
+                    omega_final = self._omega_dict[u, v] * c
                 else:
                     # Subsequent allocations: add in-place
-                    omega_final += self.omega_dict[u, v] * c
+                    omega_final += self._omega_dict[u, v] * c
 
                     # Add the symmetric (v, u) term if off-diagonal
                 if u != v:
-                    omega_final += self.omega_dict[v, u] * c
+                    omega_final += self._omega_dict[v, u] * c
         return omega_final
-
-    def compute_omega_std(self, P_dict, deriv_coef_vals):
-        n_splines = np.prod(self.n_splines)
-        omega_std = np.zeros((n_splines, n_splines))
-        for u, c_u in enumerate(deriv_coef_vals):
-            for v, c_v in enumerate(deriv_coef_vals[:u + 1]):
-                c = c_u * c_v
-                omega_std += P_dict[(u, v)] * c
-                if u != v:
-                    omega_std += P_dict[(v, u)] * c
-        return omega_std
 
     def compute_k_action(self, action_keys, action_vals, x_eval=None):
         """
-        Computes the Variational Physics Penalty Matrix (K_action) from the Weak Form.
-        Executes in O(Q) time with zero cross-term combinatorial explosion.
+        Compute K_{action} from Bilinear Differential Operators
 
         :param action_keys_left: List of parsed deriv keys for the left operator (e.g., [[0], [1], []])
         :param action_keys_right: List of parsed deriv keys for the right operator (e.g., [[0], [1], []])
@@ -305,239 +381,611 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
         K_action_final = None
 
         for i, c in enumerate(action_vals):
-            d_u = np.array(action_keys[i][0])
-            d_v = np.array(action_keys[i][1])
+            # Each key_i is a bilinear deriv
+            d_u, d_v = action_keys[i]
 
             # Use a sorted tuple cache key because integral(u_x * u) == integral(u * u_x)
             cache_key = (i, i)
 
             # --- 1. Check the Global n-Dimensional Cache ---
-            if cache_key not in self.omega_dict:
-                K_uv = None
-                for p in range(self.dim):
-                    d_up = (d_u == p).sum()
-                    d_vp = (d_v == p).sum()
-
-                    # --- 2. Check the Local 1D Micro-Cache ---
-                    cache_key_1d = (p, d_up, d_vp)
-                    if cache_key_1d not in self.integral_1d_cache:
-                        self.integral_1d_cache[cache_key_1d] = compute_spline_integral_gl(
-                            self.all_knots[p], u=d_up, v=d_vp, deg=self.deg, x_eval=x_eval
-                        )
-
-                    K_1d = self.integral_1d_cache[cache_key_1d]
-
-                    # --- 3. Assemble the Kronecker Product ---
-                    if K_uv is None:
-                        K_uv = K_1d
-                    else:
-                        K_uv = np.kron(K_uv, K_1d)
-
-                self.omega_dict[cache_key] = K_uv
+            if cache_key not in self._omega_dict:
+                self._omega_dict[cache_key] = self.compute_K_uv(d_u, d_v, x_eval)
 
             # --- 4. In-Place Memory Accumulation ---
             if K_action_final is None:
                 # First allocation
-                K_action_final = self.omega_dict[cache_key] * c
+                K_action_final = self._omega_dict[cache_key] * c
             else:
                 # Subsequent allocations
-                K_action_final += self.omega_dict[cache_key] * c
+                K_action_final += self._omega_dict[cache_key] * c
 
         # --- 5. Enforce Global Symmetry ---
         # The physical action must yield a strictly symmetric bilinear form.
-        K_action_final = (K_action_final + K_action_final.T) / 2.0
+        # u_x_sqr = np.kron(self._integral_1d_cache[(0, 1, 1)], self._integral_1d_cache[(1, 0, 0)])
+        # u_y_sqr = np.kron(self._integral_1d_cache[(0, 0, 0)], self._integral_1d_cache[(1, 1, 1)])
+        diff_sym = np.abs(K_action_final - K_action_final.T).sum()
+        assert diff_sym < self.tol, f"Weak Form Penalty Matrix not symmetric, diff={diff_sym}"
+        K_action_final = (K_action_final + K_action_final.T) / 2
         return K_action_final
 
-    def fit(self, X, y):
+    def _project_forcing_function(self):
         """
-        1. Knot
-        2. Create Basis and Calculate D_q
-        3. Write SVD -> (U, V, s) (U refers to the A matrix in that paper)
-        4. Fit EWA on (U, y, s)
-        :param X:
-        :param y:
-        :return:
+        Projects the continuous forcing function g(x) onto the B-spline basis to find w.
+        Actively reports the approximation fidelity.
         """
-        import time
+        # Evaluate exact forcing function on a dense grid
+        g_val = self.force(self.gridpoints_).ravel()
 
-        X, y = check_X_y(X, y, accept_sparse=False)
-        assert X.shape[1] == self.dim
-        n_samples = X.shape[0]
-        self.X_fit_, self.y_fit_ = X, y
-        self.fit_n = n_samples
+        # Project onto the B-spline basis: B * w = g
+        w, _, _, _ = np.linalg.lstsq(self.B_grid_, g_val, rcond=None)
 
-        self.a_, self.b_ = X.min(axis=0), X.max(axis=0)
-        if self.domain is None:
-            self.domain = list(zip(self.a_, self.b_))
+        # Validate approximation fidelity
+        g_approx = self.B_grid_ @ w
+        mse = np.mean((g_val - g_approx) ** 2)
+        var_g = np.var(g_val) if np.var(g_val) > 0 else 1.0
+        rel_error = mse / var_g
 
-        # 1. Knot Setup
-        self.generate_knots(X)
+        print(f"Forcing Term Projection Relative MSE: {rel_error:.2e}")
+        if rel_error > 0.05:
+            print("WARNING: B-spline basis may be too sparse to accurately capture the forcing function!")
 
-        self.grids = [np.linspace(*d, self.grid_size) for d in self.domain]
-        self.gridpoints = util.tensor_prod(*self.grids)
-        self.B_grid = self._build_tensor_basis(self.gridpoints)
+        return w
 
-        # 2. Lambda & Prior Vectorization
-        self.sigma_est = gsj_est(y) if self.sigma is None else self.sigma
-        log_lams = np.arange(self.log_lamb[0], self.log_lamb[1], self.log_lamb_step)
-        lam_grid = np.exp(np.sort(log_lams)[::-1])
+    def _compute_dual_F_g_dict(self, K_components: dict, w: np.ndarray) -> dict:
+        """
+        Maps the DUAL weak-form forcing components into the unified structure.
+        Computes f_i = K_i^T * w
+        """
+        dual_F_g_dict = {}
+        for i, K_i in K_components.items():
+            assert i[0] == i[1]
+            v = K_i.T @ w
+            dual_F_g_dict[i[0]] = v
 
-        if self.prior_type == "light":
-            p_dist = gamma(a=0.3, scale=1 / 0.3)
-            prior_vals = p_dist.cdf(lam_grid)
+        return dual_F_g_dict
+
+    def _compute_dual_omega_dict(self, K_components: dict) -> dict:
+        """
+        Maps the DUAL weak-form penalty matrices into the unified structure.
+        Computes \Omega_ij = K_i^T * H_0^{-1} * K_j
+        """
+        dual_omega_dict = {}
+
+        for j, K_j in K_components.items():
+            assert j[0] == j[1]
+            # Perform the O(p^2) Cholesky solve once per physical parameter
+            H0_inv_Kj = scipy.linalg.cho_solve(self.H_0_cho_, K_j)
+
+            for i, K_i in K_components.items():
+                assert i[0] == i[1]
+                omega_ij = K_i.T @ H0_inv_Kj
+                # Clean up floating point asymmetry
+                # assert np.abs(omega_ij - omega_ij.T).sum() < self.tol
+                dual_omega_dict[(i[0], j[0])] = omega_ij #(omega_ij + omega_ij.T) / 2.0
+
+        return dual_omega_dict
+
+    def precompute_forcing_components(self):
+        """
+        Computes the forcing load vector F_g = H * w using exact 1D Kronecker separation,
+        eliminating the need for D-dimensional numerical integration.
+        """
+        w = self._project_forcing_function()
+
+        if self.mode == 'DUAL':
+            # Weak form structurally uses the raw basis test functions: B_i
+            # H_0 = integral( B * B^T ) dx
+            self.H_0_ = self.compute_K_uv(d_u=[], d_v=[])
+            self.H_0_cho_ = scipy.linalg.cho_factor(self.H_0_)
+            self.F_weak_ = self.H_0_ @ w
+
+            # 2. Extract the raw K_i matrices into a clean dictionary
+            for i, (d_u, d_v) in enumerate(self._coef_keys):
+                if (i, i) not in self._omega_dict:
+                # self._coef_keys stores the derivative tuples for action_coef
+                # Generate the raw spatial matrix and store it temporarily
+                    self._omega_dict[(i, i)] = self.compute_K_uv(d_u, d_v)
+
+            # 3. Delegate to the standalone computational methods
+            self.F_g_dict = self._compute_dual_F_g_dict(self._omega_dict, w)
+            self._omega_dict = self._compute_dual_omega_dict(self._omega_dict)
+            # self.force_norm = self.F_g_dict @
+
         else:
-            prior_vals = 2 * t.cdf(25 * lam_grid, df=3) - 1
+            # Strong form evaluates the explicit component projections D_k(B_i)
+            # H_u = integral( D_u(B) * B^T ) dx
+            self.compute_omega(list(self._coef_keys), self._initial_coef_vals)
+            self.F_g_dict = {}
+            for i, u in enumerate(self._coef_keys):
+                H_u = self.compute_K_uv(u, [])
+                self.F_g_dict[i] = H_u @ w
 
-        prior = np.diff(np.r_[0, prior_vals[::-1]])[::-1]
-        prior, lam_grid = prior[prior > self.tol], lam_grid[prior > self.tol]
+        self.force_norm = w.T @ self.compute_K_uv([], []) @ w / 2
 
-        if self.norm_omega:
-            highest_deriv = len(self.deriv_coef_vals) - 1
-            lam_grid /= self.step_size[0] ** (highest_deriv * 2)
+    def get_omega_theoretical_scale(self, alpha, beta):
+        """
+        Class method wrapper to compute the theoretical Galerkin scale S
+        dynamically using the model's internal knot spacing.
+        """
+        # Calculate the average mesh spacing 'h' for each dimension
+        h_vec = np.zeros(self.dim)
+        for d in range(self.dim):
+            knots = self.all_knots[d]
+            # Number of intervals = (total basis functions) - degree
+            num_intervals = self.n_splines[d] - self.deg
+            h_vec[d] = (knots[-1] - knots[0]) / num_intervals
 
-        # 3. Basis & Orthogonalization
-        B_s = self._build_tensor_basis(X)
-        G = util.compute_G(B_s)
+        h_vec = np.asarray(h_vec, dtype=float)
+        alpha = np.asarray(alpha, dtype=int)
+        beta = np.asarray(beta, dtype=int)
 
+        # 1. Compute the exponent for each dimension
+        powers = 1 - alpha - beta
+        scale_factor = np.prod(h_vec ** powers)
+        return float(scale_factor)
+
+    def _build_penalty_matrix(self, coef_vals: np.ndarray) -> np.ndarray:
+        """Dispatches to the correct continuous integral calculation based on mode."""
         if self.mode == 'PDE':
-            coef_vals = np.array(self.deriv_coef_vals, dtype=float)
-        else:
-            coef_vals = np.array(self.action_vals, dtype=float)
+            return self.compute_omega(list(self._coef_keys), coef_vals)
+        return self.compute_k_action(self._coef_keys, coef_vals)
 
-        for i in range(self.max_iter):
-            if self.mode == 'PDE':
-                omega = self.compute_omega(list(self.coef_keys), coef_vals) # The integral should be just evaluation at knots
-            else:
-                omega = self.compute_k_action(self.coef_keys, coef_vals)
+    def _build_penalty_and_force(self, coef_vals):
+        penalty_matrix = np.zeros_like(self.G_)
+        forcing_vector = np.zeros(self.G_.shape[0])
 
-            total_var = np.trace(np.linalg.solve(G, omega))
+        for i in range(len(self._coef_keys)):
+            forcing_vector += coef_vals[i] * self.F_g_dict[i]
+            for j in range(len(self._coef_keys)):
+                penalty_matrix += coef_vals[i] * coef_vals[j] * self._omega_dict[(i, j)]
 
-            # TODO: looks deriv will blow up when more knots
-            # if self.norm_omega:
-            #     highest_deriv = len(self.deriv_coef_vals) - 1
-            #     omega *= (self.step_size[0] ** (highest_deriv * 2))
-                # print(omega.max(axis=1))
-            # orth = orthogonalize_basis(B_s, omega)
+        assert np.abs(penalty_matrix - penalty_matrix.T).max() < self.tol
+        penalty_matrix = (penalty_matrix + penalty_matrix.T) / 2.0
+        return penalty_matrix, forcing_vector
 
-            t0 = time.time()
-            orth = orthogonalize_basis_fast(G, omega, mode=self.mode) # This is slow
-            # k = np.argmax(orth['s'].cumsum() >= total_var * 0.99)
-            # print(f'{k} PC for 99% Var')
-            t1 = time.time()
-            print(i, t1 - t0)
+    # def _build_forcing_vector(self, coef_vals: np.ndarray) -> np.ndarray:
+    #     """Constructs the projected forcing constraint vector."""
+    #     """
+    #     PDE: sum_k int (D_k(B) * g); g = B * w; for all diff. op. D_k in L
+    #     Dual: int (B * g)
+    #     """
+    #     if self.mode == 'DUAL':
+    #         return self.F_weak_
+    #
+    #     f_int = np.zeros(np.prod(self.n_splines))
+    #     for u, c_u in zip(self._coef_keys, coef_vals):
+    #         f_int += c_u * self.F_g_dict[u]
+    #     return f_int
 
-            # B_integral = (self.B_grid.T @ self.B_grid) / self.grid_size
-            # orth_grid = orthogonalize_basis(self.B_grid / np.sqrt(self.grid_size), omega)
-            self.V_, self.s_ = orth['V'], orth['s']
-            self.U_ = B_s @ self.V_
 
-            # 4. EWA Logic
-            res = fit_ewa(
-                y=y, ftrue=y, U=self.U_, V=self.V_, s=self.s_,
-                lam=lam_grid, prior=prior,
-                sig_eps_est=self.sigma_est, gamma_mult=self.gamma_mult,
+    def galerkin_force_diagnostics(self):
+        op_dfs = {
+            op_key: util.tensor_diagnostics(force_vec.reshape(*self.n_splines))
+            for op_key, force_vec in self.F_g_dict.items()
+        }
+
+        # 2. Generate a single Subplot Grid
+        fig, axes = plt.subplots(len(op_dfs), self.dim,
+                                 figsize=(6 * self.dim, 4 * len(op_dfs)),
+                                 squeeze=False)
+
+        fig.suptitle("Galerkin Force Diagnostics", fontsize=15, fontweight='bold', y=1.02)
+
+        for row, (op_key, stat_df) in enumerate(op_dfs.items()):
+
+            op_name = self._coef_keys[op_key] if hasattr(self, '_coef_keys') and isinstance(op_key, int) else op_key
+
+            for axis in range(self.dim):
+                ax = axes[row, axis]
+
+                slice_df = stat_df.loc[axis]
+                x_locs = self.get_spline_locations(axis)
+
+                # Lists to collect line handles for a unified legend
+                lines, labels = [], []
+
+                # --- 3a. Plot Primary Metrics (Energy, Max Amp) ---
+                primary_metrics = [m for m in slice_df.columns if m != 'sparsity']
+                for metric in primary_metrics:
+                    line, = ax.plot(x_locs, slice_df[metric], 'o-', ms=4,
+                                    label=metric.replace('_', ' ').title())
+                    lines.append(line)
+                    labels.append(line.get_label())
+
+                # --- 3b. Plot Secondary Metric (Sparsity) on Twin Axis ---
+                if 'sparsity' in slice_df.columns:
+                    ax2 = ax.twinx()
+                    # Use a distinct dashed style and a specific color (red) so it stands out
+                    line2, = ax2.plot(x_locs, slice_df['sparsity'], 's--', color='tab:red', ms=4,
+                                      label='Sparsity')
+                    lines.append(line2)
+                    labels.append(line2.get_label())
+
+                    # Color-code the right y-axis to match the sparsity line
+                    ax2.set_ylabel("Sparsity Ratio", color='tab:red', fontsize=10)
+                    ax2.tick_params(axis='y', labelcolor='tab:red')
+                    ax2.set_ylim(0, 1)
+
+                # --- 4. Batch Formatting & Unified Legend ---
+                ax.set(title=f"Operator: {op_name} | Axis: {axis}",
+                       xlabel=f"Domain Location (Dim {axis})")
+
+                if axis == 0:
+                    ax.set_ylabel("Magnitude (Energy / Max Amp)")
+
+                ax.grid(True, ls='--', alpha=0.6)
+
+                # Pass the collected lines/labels to the primary axis legend to prevent overlapping boxes
+                ax.legend(lines, labels, fontsize=9, loc='upper right')
+
+                # Pin primary y-axis to 0 if all primary values are positive
+                if slice_df[primary_metrics].min().min() >= 0:
+                    ax.set_ylim(bottom=0)
+
+        plt.tight_layout()
+        plt.show()
+
+    def galerkin_penalty_diagnostics(self):
+        op_dfs = {}
+        tensor_shape = tuple(self.n_splines) * 2
+
+        for (idx_test, idx_trial), matrix in self._omega_dict.items():
+            key_test = self._coef_keys[idx_test]
+            key_trial = self._coef_keys[idx_trial]
+
+            name_test = util.format_latex_name(key_test)
+            name_trial = util.format_latex_name(key_trial)
+
+            factors_test = self.parse_derivative_order(key_test)
+            factors_trial = self.parse_derivative_order(key_trial)
+
+            alpha_total = np.sum(factors_test, axis=0)
+            beta_total = np.sum(factors_trial, axis=0)
+
+            # --- Clean Reuse of Your Class Method ---
+            # Note: adjust to self.calculate_galerkin_scale(alpha, beta) if that is what you named it
+            scale_factor = self.get_omega_theoretical_scale(alpha_total, beta_total)
+
+            print(f"Normalizing ({name_test}, {name_trial}) | Scale Factor: {scale_factor:.2e}")
+
+            # Normalize the matrix to O(1) baseline
+            matrix_normalized = matrix / scale_factor
+
+            op_dfs[(name_test, name_trial)] = util.tensor_diagnostics(matrix_normalized.reshape(*tensor_shape))
+
+        # =================================================================
+        # 3. Generate the Scaled Subplot Grid
+        # =================================================================
+        total_axes = 2 * self.dim
+        fig, axes = plt.subplots(len(op_dfs), total_axes,
+                                 figsize=(6 * total_axes, 4 * len(op_dfs)),
+                                 squeeze=False)
+
+        fig.suptitle("Mesh-Normalized Galerkin Penalty Diagnostics",
+                     fontsize=16, fontweight='bold', y=1.02)
+
+        for row, ((name_test, name_trial), stat_df) in enumerate(op_dfs.items()):
+            for axis in range(total_axes):
+                ax = axes[row, axis]
+
+                space_name = "Test Space" if axis < self.dim else "Trial Space"
+                phys_dim = axis % self.dim
+
+                slice_df = stat_df.loc[axis]
+                x_locs = self.get_spline_locations(phys_dim)
+                lines, labels = [], []
+
+                # --- Primary Metrics (Normalized Energy, Max Amp) ---
+                primary_metrics = [m for m in slice_df.columns if m != 'sparsity']
+                for metric in primary_metrics:
+                    line, = ax.plot(x_locs, slice_df[metric], 'o-', ms=4,
+                                    label=metric.replace('_', ' ').title())
+                    lines.append(line)
+                    labels.append(line.get_label())
+
+                # --- Secondary Metric (Sparsity) ---
+                if 'sparsity' in slice_df.columns:
+                    ax2 = ax.twinx()
+                    line2, = ax2.plot(x_locs, slice_df['sparsity'], 's--', color='tab:red', ms=4,
+                                      label='Sparsity')
+                    lines.append(line2)
+                    labels.append(line2.get_label())
+
+                    ax2.set_ylabel("Sparsity Ratio", color='tab:red', fontsize=10)
+                    ax2.tick_params(axis='y', labelcolor='tab:red')
+                    ax2.set_ylim(0, 1)
+
+                # --- Labels and Unified Legend ---
+                ax.set(title=f"{space_name} | Dim: {phys_dim}",
+                       xlabel=f"Domain Location (Dim {phys_dim})")
+
+                if axis == 0:
+                    ax.set_ylabel(f"Pair: ({name_test}, {name_trial})\n\nNormalized Magnitude")
+
+                ax.grid(True, ls='--', alpha=0.6)
+                ax.legend(lines, labels, fontsize=9, loc='upper right')
+
+                if primary_metrics and slice_df[primary_metrics].min().min() >= 0:
+                    ax.set_ylim(bottom=0)
+
+        plt.tight_layout()
+        plt.show()
+
+    def compute_physics_loss(self, theta, gram_matrices, v_vec):
+        """
+        Computes the Unbiased PDE Loss: L(theta | beta) = 1/2 * theta^T * G_unbiased * theta - theta^T * v
+        Reuses the pre-computed system matrices and applies the EIV trace correction.
+        """
+        # 1. Fetch empirical matrices directly from the existing pipeline
+        pde_loss = 0.5 * np.dot(theta, gram_matrices @ theta) - np.dot(theta, v_vec) + self.force_norm
+        return float(pde_loss)
+
+    def fit(self, X: np.ndarray, y: np.ndarray):
+        """Fits the EWA Spline model to the data."""
+        X, y = check_X_y(X, y, accept_sparse=False)
+        n = len(y)
+        self.X_fit_, self.y_fit_ = X, y
+
+        self._parse_physics_configuration()
+        self._initialize_basis(X)
+        self._setup_priors_and_lambda(X, y)
+        self.precompute_forcing_components()  # Populates self.F_g_dict_ or self.F_weak_
+        #self.galerkin_force_diagnostics()
+        #self.galerkin_penalty_diagnostics()
+
+        coef_vals = self._initial_coef_vals.copy()
+        # --- Block Coordinate Descent for Physics Parameters ---
+        for iteration in range(self.max_iter):
+            penalty_matrix, forcing_vector = self._build_penalty_and_force(coef_vals)
+
+            # 1. Orthogonalization via GEVP
+            orth = util.orthogonalize_basis_fast(self.G_, penalty_matrix)
+            self.V_, self.s_raw_ = orth['V'], orth['s_raw'] #G^{-1} = VV^T
+            self.U_ = self.B_data_ @ self.V_
+
+            # 2. Project Forcing Vector into Orthogonal Space
+            force_proj = self.V_.T @ forcing_vector
+            s = np.maximum(self.s_raw_, 0)
+
+            # 3. Fit EWA Model
+            self.ewa_res_ = util.fit_ewa(
+                y=y, ftrue=y, U=self.U_, V=self.V_, s=s,
+                lam=self.lam_grid_, prior=self.prior_,
+                sig_eps_est=self.sigma_est_, gamma_mult=self.gamma_mult,
+                force_proj=force_proj
             )
 
-            #self.res = res
-            if self.mode == 'PDE':
-                gram_matrices = self.update_gram_matrix(self.omega_dict, res['beta'])
-            else:
-                gram_matrices = self.update_action_gram_matrix(self.omega_dict, res['beta'])
-            coef_mean, coef_var = self.get_coef_dist(gram_matrices, coef_vals)
+            gram_matrices, v_vec = self.compute_theta_system_pde(self._omega_dict, self.ewa_res_['beta'])
+            coef_mean, self.coef_var = self.get_coef_dist(gram_matrices, coef_vals, v_vec,
+                                                          beta=self.ewa_res_['beta'],
+                                                          V=self.V_,
+                                                          shrink_weight=self.ewa_res_['shrink_weight'],
+                                                          sigma_sq=self.sigma_est_ ** 2
+                                                          )
 
-            old_theta = coef_vals[self.trainable_idx]
-            pct_chg = np.abs(old_theta - coef_mean).sum() / np.abs(old_theta).sum()
-            coef_vals[self.trainable_idx] = coef_mean
-            print(coef_mean)
+            # 5. Check Convergence
+            old_theta = coef_vals[self._trainable_idx]
+            coef_pct_chg = np.abs(old_theta - coef_mean).sum() / (np.abs(old_theta).sum() + 1e-8)
+            coef_vals[self._trainable_idx] = coef_mean
 
-            if pct_chg < self.min_pct_chg:
+            if coef_pct_chg < self.min_pct_chg:
+                logger.info("Physics parameters converged.")
                 break
 
-        self.res = res
-        self.deriv_coef_vals = coef_vals
+            w = self.ewa_res_['weights']
+            rss = np.sum((self.ewa_res_['fhat_ewa'] - y) ** 2)
+            self.sigma_est_ = np.sqrt(rss / (len(y) - self.ewa_res_['trace_hat']))
+
+            w_mean = (self.lam_grid_ * w).sum()
+            physics_loss = self.compute_physics_loss(coef_vals, gram_matrices, v_vec)
+            total_loss = n * self.sigma_est_ ** 2 + w_mean * physics_loss
+
+            logger.info(f"Iteration {iteration} | Coefficients: {coef_mean} | Change: {coef_pct_chg:.4e} | "
+                        f"sigma_est: {self.sigma_est_:.4e} | physics_loss: {physics_loss:.4e} | "
+                        f"Total loss: {total_loss: .4e} | " 
+                        f"w_mean: {w_mean:.4e} | w_mle: {self.lam_grid_[np.argmax(w)]:.4e}")
+
+        # --- Finalize Fitted State ---
+        self.deriv_coef_vals_ = coef_vals
         self.coef_mean = coef_mean
-        self.coef_var = coef_var
-        # 5. Extract Coefficients
-        # We only need the mean weights across the aggregation
-        self.weights = pd.Series(res['weights'], index=lam_grid).sort_index()
-        self.sigma_regr_adj = np.sqrt(np.sum((res['fhat_ewa'] - y)**2) / (len(y) - np.trace(res['hat_matrix'])))
-        self.sigma_regr = np.sqrt(np.mean((res['fhat_ewa'] - y)**2))
+        self.weights_ = pd.Series(self.ewa_res_['weights'], index=self.lam_grid_).sort_index()
+        # self.weights_.plot(logx=True)
         return self
 
-    def update_gram_matrix(self, omega_dict, beta):
-        m = len(self.coef_keys)
+    def compute_theta_system_pde(self, omega_dict, beta):
+        m = len(self._coef_keys)
         gram_matrices = np.zeros((m, m))
         for key, omega_uv in omega_dict.items():
             gram_matrices[key] = beta.T @ omega_uv @ beta
-        return gram_matrices
 
-    def update_action_gram_matrix(self, omega_dict, beta):
+        v_vec = np.zeros(m)
+        for i, u in enumerate(self._coef_keys):
+            v_vec[i] = beta.T @ self.F_g_dict[i]
+
+        return gram_matrices, v_vec
+
+    def compute_theta_system_action(self, omega_dict, beta, V):
         """
         Builds the Gram matrix for theta by minimizing the Weak-Form Galerkin residual.
-        Instead of integrating cross-terms, it projects beta through the independent
-        action matrices and measures their vector alignments.
         """
-        m = len(self.coef_keys)
-        V = np.zeros((len(beta), m))
+        m = len(self._coef_keys)
+        V_weak = np.zeros((len(beta), m))
 
         for key, K_q in omega_dict.items():
             assert key[0] == key[1]
             K_q = omega_dict[key]
+            # Enforce symmetry to clean up float imprecision from integration
+            assert np.abs(K_q - K_q.T).sum() < self.tol
             K_q = (K_q + K_q.T) / 2.0
-            V[:, key[0]] = K_q @ beta
+            V_weak[:, key[0]] = K_q @ beta
 
-        # --- TRAP 2 FIX: BOUNDARY FLUX ISOLATION ---
-        # Create an interior mask for the 1D basis functions
-        mask_1d = [np.zeros(n) for n in self.n_splines]
-        for i, n in enumerate(self.n_splines):
-            mask_1d[i][self.deg: n - self.deg] = 1.0
+        # --- EUCLIDEAN ALIGNMENT FOR NUMERICAL STABILITY ---
+        # Applying V^T (which perfectly reconstructs G^-1) amplifies B-spline float noise by 10^8.
+        # Because \theta are global scalars without spatial saddle-point topology,
+        # we safely revert to the noise-resistant Euclidean inner product to compute stable gradients.
 
-        # Expand the mask to the full N-dimensional tensor product grid
-        interior_mask = mask_1d[0]
-        for i in range(1, self.dim):
-            interior_mask = np.kron(interior_mask, mask_1d[i])
+        C_weak = V.T @ V_weak
+        C_force = V.T @ self.F_weak_
+        gram_matrix = C_weak.T @ C_weak
+        # gram_matrix = V_weak.T @ V_weak
+        assert (np.abs(gram_matrix - gram_matrix.T) / np.abs(gram_matrix)).sum() < self.min_pct_chg
+        gram_matrix = (gram_matrix + gram_matrix.T) / 2.0
 
-        interior_mask = interior_mask.astype(bool)
+        v_vec = C_weak.T @ C_force #V_weak.T @ self.F_weak_
+        return gram_matrix, v_vec
 
-        # Filter out the boundary residual vectors
-        V = V[interior_mask, :]
+    def get_coef_dist(self, G, deriv_coef, v_vec, beta, V, shrink_weight, sigma_sq, relaxation=1.0):
+        """
+        Computes Exact 2nd-Order Unbiased Physical Parameters and Variance.
+        Evaluates the current stochastic trajectory (theta^(t)) to neutralize
+        Errors-in-Variables (EIV) bias, Jensen's matrix ratio bias, and the
+        empirical Jacobian plug-in inflation.
+        """
+        T = self._trainable_idx
+        Tc = [i for i, _ in enumerate(self._coef_keys) if i not in self._trainable_idx]
 
-        # The new Gram matrix is the inner product of the residual vectors
-        gram_matrix = V.T @ V
-        return gram_matrix
+        # ==========================================================
+        # 1. 1st-Order Unbiased Base Matrices (EIV Correction)
+        # ==========================================================
+        G_unbiased = np.zeros_like(G)
+        W2 = shrink_weight ** 2
 
-    def get_coef_dist(self, G, deriv_coef):
-        T = self.trainable_idx
-        Tc = [i for i, _ in enumerate(self.coef_keys) if i not in self.trainable_idx]
-        coef_Tc = deriv_coef[Tc]
-        coef_mean = -np.linalg.solve(G[T][:, T], G[T][:, Tc] @ coef_Tc)
-        coef_var = np.linalg.inv(G[T][:, T])
+        for k in range(G.shape[0]):
+            for j in range(G.shape[1]):
+                if (k, j) in self._omega_dict:
+                    Omega_kj = self._omega_dict[(k, j)]
+                elif (j, k) in self._omega_dict:
+                    Omega_kj = self._omega_dict[(j, k)].T
+                else:
+                    G_unbiased[k, j] = G[k, j]
+                    continue
+
+                Omega_V = Omega_kj @ V
+                bias = sigma_sq * np.dot(np.sum(V * Omega_V, axis=0), W2)
+                G_unbiased[k, j] = G[k, j] - bias
+
+        G_TT = G_unbiased[np.ix_(T, T)]
+        G_TT_inv = np.linalg.inv(G_TT)
+
+        # ==========================================================
+        # 2. The Naive BCD Target (1st-Order Stationarity)
+        # ==========================================================
+        if len(Tc) == 0:
+            theta_naive = G_TT_inv @ v_vec[T]
+        else:
+            G_TTc = G_unbiased[np.ix_(T, Tc)]
+            coef_Tc = deriv_coef[Tc]
+            theta_naive = G_TT_inv @ (v_vec[T] - G_TTc @ coef_Tc)
+
+        # ==========================================================
+        # 3. Empirical Jacobians at Stochastic State \theta^{(t)}
+        # ==========================================================
+        N_beta = len(beta)
+        H = np.zeros((len(T), N_beta))
+        grad_H = np.zeros((len(T), N_beta, N_beta))
+
+        for idx, k in enumerate(T):
+            # Base forcing function
+            H_k = self.F_g_dict[k].copy()
+            Sum_Omega_grad = np.zeros((N_beta, N_beta))
+
+            for j in range(len(self._coef_keys)):
+                if (k, j) in self._omega_dict:
+                    Omega_kj = self._omega_dict[(k, j)]
+                elif (j, k) in self._omega_dict:
+                    Omega_kj = self._omega_dict[(j, k)].T
+                else:
+                    continue
+
+                Omega_grad = Omega_kj + Omega_kj.T
+                # Evaluated precisely at the current path state: deriv_coef[j]
+                H_k -= deriv_coef[j] * (Omega_grad @ beta)
+                Sum_Omega_grad += deriv_coef[j] * Omega_grad
+
+            H[idx, :] = H_k
+            grad_H[idx, :, :] = -Sum_Omega_grad
+
+        # J_theta mapping: d(theta) / d(beta)
+        J_theta = G_TT_inv @ H
+
+        # ==========================================================
+        # 4. The 2nd-Order Unbiased Estimator (Jensen's Shift)
+        # ==========================================================
+        b_ratio = np.zeros(len(T))
+        for idx, k in enumerate(T):
+            for i_idx, i in enumerate(T):
+                if (k, i) in self._omega_dict:
+                    Omega_ki = self._omega_dict[(k, i)]
+                elif (i, k) in self._omega_dict:
+                    Omega_ki = self._omega_dict[(i, k)].T
+                else:
+                    continue
+
+                # Sensitivity of the Curvature Matrix: d(G_ki) / d(beta)
+                J_G_ki = (Omega_ki + Omega_ki.T) @ beta
+
+                # Exact Spectral Trace: tr(J_G_ki^T * Sigma_beta * J_theta_i^T)
+                covariance_term = sigma_sq * np.sum((J_G_ki @ V) * W2 * (J_theta[i_idx, :] @ V))
+                b_ratio[idx] += covariance_term
+
+        # Construct the true mathematically unbiased target
+        theta_unbiased = theta_naive + (G_TT_inv @ b_ratio)
+
+        # ==========================================================
+        # 5. Iterative Path Update
+        # ==========================================================
+        # Execute the Block Coordinate Descent relaxation towards the unbiased root
+        coef_mean = deriv_coef[T] + relaxation * (theta_unbiased - deriv_coef[T])
+
+        # ==========================================================
+        # 6. Exact 2nd-Order Variance Geometry (Plug-in Corrected)
+        # ==========================================================
+        # Base Asymptotic Variance
+        JV = J_theta @ V
+        coef_var_base = sigma_sq * (JV * W2[None, :]) @ JV.T
+
+        # Tensor projection for the exact 2nd-order geometrical inflation
+        grad_J = np.tensordot(G_TT_inv, grad_H, axes=([1], [0]))
+        var_correction = np.zeros((len(T), len(T)))
+        W2_mat = W2[:, None] * W2[None, :]
+
+        for i in range(len(T)):
+            V_grad_J_i_V = V.T @ grad_J[i] @ V
+            for j in range(len(T)):
+                V_grad_J_j_V = V.T @ grad_J[j] @ V
+                trace_val = np.sum(V_grad_J_i_V * V_grad_J_j_V * W2_mat)
+                var_correction[i, j] = (sigma_sq ** 2) * trace_val
+
+        # Subtract the deterministic empirical plug-in inflation
+        coef_var = coef_var_base - var_correction
+
         return coef_mean, coef_var
 
-
-    def predict(self, X):
-        check_is_fitted(self)
+    def predict(self, X: np.ndarray) -> pd.DataFrame:
+        """Predicts the continuous function evaluation at X alongside confidence intervals."""
+        check_is_fitted(self, 'ewa_res_')
         X = check_array(X, ensure_2d=False)
-        assert X.shape[1] == self.dim
 
-        # Project new X into the orthogonalized basis
         B_new = self._build_tensor_basis(X)
         U_new = B_new @ self.V_
-        y_hat = U_new @ self.res['theta_hat']
+        y_hat = U_new @ self.ewa_res_['theta_hat']
 
-        # np.diag(U_new @ U_new.T) + 1
-        variances = np.sum((U_new ** 2) * (self.res['shrink_weight'] ** 2)[None, :], axis=1) + 1 #TODO: **2?
-        se = self.sigma_regr * np.sqrt(variances)
+        # CI of the fitted function itself (excluding +1 observation noise)
+        variances = np.sum((U_new ** 2) * (self.ewa_res_['shrink_weight'] ** 2)[None, :], axis=1) + 1
+        se = self.sigma_est_ * np.sqrt(variances)
         interval = norm.ppf(1 - self.alpha / 2) * se
-        multi_idx = pd.MultiIndex.from_arrays(X.T, names=self.variables)
-        preds = pd.DataFrame({'fhat': y_hat, 'se': se,
-                             'ci_lower': y_hat - interval, 'ci_upper': y_hat + interval},
-                             index=multi_idx)
-        return preds
+
+        idx = pd.MultiIndex.from_arrays(X.T, names=self.variables)
+        return pd.DataFrame({
+            'fhat': y_hat,
+            'se': se,
+            'ci_lower': y_hat - interval,
+            'ci_upper': y_hat + interval
+        }, index=idx)
 
     def plot_fit(self, x_test=None, y_test=None, show_ci=True):
         check_is_fitted(self)
-        x_grid = self.gridpoints
+        x_grid = self.gridpoints_
         fit_preds = self.predict(x_grid)
 
         if x_test is None:
@@ -554,10 +1002,10 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
             ax.plot(x_grid[:, 0], fit_preds['fhat'], color='C0', lw=2, label='EWA Prediction')
             ax.scatter(x_scatter[:, 0], y_scatter, s=10, color='black', alpha=0.5, label='Data')
 
-            deriv_coef = list(map(lambda x: float(f"{x:.4g}"), self.deriv_coef_vals))
+            deriv_coef = list(map(lambda x: float(f"{x:.4g}"), self.deriv_coef_vals_))
             title = (
                 f"EWA fit [n={len(self.X_fit_)}, deg={self.deg}, deriv_coef={deriv_coef}, "
-                f"nk={self.n_knots_1d}, sigma={self.sigma_regr:.3f}, "
+                f"nk={self.n_knots_1d}, sigma={self.sigma_est_:.3f}, "
                 f"{100 * (1 - self.alpha):.0f}% CI]"
             )
             ax.set(title=title, xlabel="X", ylabel="y")
@@ -565,27 +1013,21 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
             plt.show()
 
         elif self.dim == 2:
-            X = x_grid[:, 0].reshape(self.grid_size, self.grid_size)
-            Y = x_grid[:, 1].reshape(self.grid_size, self.grid_size)
-            Z = fit_preds['fhat'].values.reshape(self.grid_size, self.grid_size)
-
-            # 3. Plot the 2D Z array directly
-            # Note: x and y tick labels can be specified using xticklabels and yticklabels
-            fig, ax = plt.subplots(figsize=(6, 5))
+            X = x_grid[:, 0].reshape(self.grid_size_, self.grid_size_)
+            Y = x_grid[:, 1].reshape(self.grid_size_, self.grid_size_)
+            Z = fit_preds['fhat'].values.reshape(self.grid_size_, self.grid_size_)
             vmax = np.abs(y_scatter).max()
-            norm = Normalize(vmin=-vmax, vmax=vmax)
-            c = ax.contourf(X, Y, Z, levels=50, cmap=CMAP, norm=norm)
 
-            # Add scatter
+            norm = util.norm_color(vmin=-vmax, vmax=vmax)
+            fig, ax = util.contour_plot(X, Y, Z, vmin=-vmax, vmax=vmax)
             ax.scatter(x_scatter[:, 0], x_scatter[:, 1], c=y_scatter,
-                       norm=norm, cmap=CMAP, edgecolors='black', s=20, label='Data')
+                       norm=norm, cmap=util.CMAP, edgecolors='black', s=20, label='Data')
 
-            fig.colorbar(c, ax=ax)
-            deriv_coef = list(map(lambda x: float(f"{x:.4g}"), self.deriv_coef_vals))
-            deriv_coef = dict(zip(list(map(str, self.coef_keys)), deriv_coef))
+            deriv_coef = list(map(lambda x: float(f"{x:.4g}"), self.deriv_coef_vals_))
+            deriv_coef = dict(zip(list(map(str, self._coef_keys)), deriv_coef))
             title = (
                 f"2D EWA fit [n={len(self.X_fit_)}, deg={self.deg}, deriv_coef={deriv_coef}, "
-                f"nk={self.n_knots_1d}, sigma={self.sigma_regr:.3f}, "
+                f"nk={self.n_knots_1d}, sigma={self.sigma_est_:.3f}, "
                 f"{100 * (1 - self.alpha):.0f}% CI]"
             )
             ax.set(title=title, xlabel="X1", ylabel="X2")
@@ -596,13 +1038,13 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
 
     @property
     def basis_functions(self):
-        basis = self.B_grid @ self.V_
-        basis_wgt = self.res['theta_hat']
+        basis = self.B_grid_ @ self.V_
+        basis_wgt = self.ewa_res_['theta_hat']
 
         basis_decomp = basis * basis_wgt[None, :]
         feature_importance = (basis_decomp ** 2).sum(axis=0)
         feature_importance = feature_importance / feature_importance.sum()
-        multi_idx = pd.MultiIndex.from_arrays(self.gridpoints.T, names=self.variables)
+        multi_idx = pd.MultiIndex.from_arrays(self.gridpoints_.T, names=self.variables)
 
         basis_decomp = pd.DataFrame(basis_decomp, index=multi_idx, columns=feature_importance) #.round(4)
         basis_decomp = basis_decomp.sort_index(axis=1, ascending=False)
@@ -628,7 +1070,7 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
         # Format column names to percentage strings
         top_bases = df2.iloc[:, :n_col]
         global_vmax = np.abs(top_bases.values).max()
-        common_norm = Normalize(vmin=-global_vmax, vmax=global_vmax)
+        #common_norm = Normalize(vmin=-global_vmax, vmax=global_vmax)
 
         # --- 1D Case: All bases on a single line plot ---
         if self.dim == 1:
@@ -640,8 +1082,8 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
 
         # --- 2D Case: Grid of Heatmaps ---
         elif self.dim == 2:
-            grid_shape = (len(self.grids[0]), len(self.grids[1]))
-            X1, X2 = np.meshgrid(self.grids[0], self.grids[1], indexing='ij')
+            grid_shape = (len(self.grids_[0]), len(self.grids_[1]))
+            X1, X2 = np.meshgrid(self.grids_[0], self.grids_[1], indexing='ij')
 
             # Setup subplot grid (e.g., 3 columns max per row)
             cols = min(n_col, 3)
@@ -657,7 +1099,9 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
                 Z = top_bases.iloc[:, idx].values.reshape(grid_shape)
 
                 # Use coolwarm to easily see positive (red) and negative (blue) basis weights
-                ax.contourf(X1, X2, Z, levels=30, cmap=CMAP, norm=common_norm)
+                _, ax = util.contour_plot(X1, X2, Z, ax=ax,
+                                            vmin=-global_vmax, vmax=global_vmax, levels=30, cbar=False)
+                #ax.contourf(X1, X2, Z, levels=30, cmap=util.CMAP, norm=common_norm)
                 ax.set(title=f"Basis {idx + 1} [Var: {df2.columns[idx]}]", xlabel="X1", ylabel="X2")
 
             # Hide any empty subplots if n_col doesn't perfectly fill the grid
@@ -665,18 +1109,18 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
                 r, c = divmod(idx, cols)
                 axes[r, c].axis('off')
 
-            sm = ScalarMappable(norm=common_norm, cmap=CMAP)
+            sm = util.map_color(vmin=-global_vmax, vmax=global_vmax)
             fig.colorbar(sm, ax=axes.ravel().tolist(), aspect=40, pad=0.03, label='Basis Weight Magnitude')
             fig.suptitle(f'Top {n_col} 2D Basis Functions ({exp_var[n_col - 1] * 100:.1f}% Variance)', fontsize=14)
             plt.show()
 
         # --- 3D Case: Grid of Heatmaps (Sliced at middle of Z-axis) ---
         elif self.dim == 3:
-            grid_shape = (len(self.grids[0]), len(self.grids[1]), len(self.grids[2]))
+            grid_shape = (len(self.grids_[0]), len(self.grids_[1]), len(self.grids_[2]))
 
             # Find the middle slice of the 3rd dimension
-            z_mid = len(self.grids[2]) // 2
-            z_val = self.grids[2][z_mid]
+            z_mid = len(self.grids_[2]) // 2
+            z_val = self.grids_[2][z_mid]
 
             cols = min(n_col, 3)
             rows = int(np.ceil(n_col / cols))
@@ -690,8 +1134,7 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
                 Z_full = top_bases.iloc[:, idx].values.reshape(grid_shape)
                 Z_slice = Z_full[:, :, z_mid]
 
-                cf = ax.contourf(self.grids[0], self.grids[1], Z_slice, levels=30, cmap=CMAP)
-                fig.colorbar(cf, ax=ax)
+                fig, ax = util.contour_plot(self.grids_[0], self.grids_[1], Z_slice, levels=30)
                 ax.set(title=f"Basis {idx + 1} [Var: {df2.columns[idx]}]", xlabel="X1", ylabel="X2")
 
             for idx in range(n_col, rows * cols):
@@ -706,7 +1149,7 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
             print(f"Plotting basis functions not supported for dimension {self.dim} > 3.")
 
     def plot_coef_dist(self, **kwargs):
-        labels = [rf'$\theta_{{{i}}}$' for i in self.trainable_idx]
+        labels = [rf'$\theta_{{{i}}}$' for i in self._trainable_idx]
         util.mvn_pairplot(self.coef_mean, self.coef_var, labels=labels,
                           title=r'Density of Physical $\theta$ given $\hat \beta$', **kwargs)
 

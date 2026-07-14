@@ -1,12 +1,18 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.interpolate import splev, splrep
+from scipy.interpolate import splev, splrep, BSpline
 from scipy.linalg import lstsq
 import scipy.linalg as la
 from joblib import Parallel, delayed
 from tqdm import tqdm
 from scipy.linalg import eigh
 from scipy.stats import norm, multivariate_normal
+import seaborn as sns
+from matplotlib.colors import Normalize, CenteredNorm
+from matplotlib.cm import ScalarMappable
+import pandas as pd
+
+CMAP = sns.diverging_palette(20, 220, as_cmap=True)
 
 
 def parallel(func, iterable, n_jobs=-1, disable_par=False, **kwargs):
@@ -25,13 +31,6 @@ def project_to_bspline(y, x, s=0, k=3):
     tck = splrep(x, y, s=s, k=k)
     y_fit = splev(x, tck)
     return y_fit
-
-
-import numpy as np
-from scipy.interpolate import BSpline
-
-import numpy as np
-from scipy.interpolate import BSpline
 
 
 def compute_spline_integral_gl(all_knots, u, v, deg, x_eval=None):
@@ -141,80 +140,6 @@ def compute_spline_integral_simp(all_knots, u=2, v=2, deg=3):
     Omega_uv = (Bu.T * wts) @ Bv
     return Omega_uv
 
-def orthogonalize_basis_robust(B, omega, tol=1e-10):
-    """
-    Robust simultaneous diagonalization handling singular/near-singular metric G = B^T @ B.
-    Uses subspace projection to explicitly remove the null space before diagonalizing.
-    """
-    # 1. Form the overlap matrix (Metric)
-    G = B.T @ B
-
-    # 2. Diagonalize G to identify its principal components and null space
-    # Since G is symmetric positive semi-definite, standard eigh is safe
-    evals_G, evecs_G = np.linalg.eigh(G)
-
-    # 3. Filter out the near-singular (unstable) subspace
-    # We scale the tolerance by the largest eigenvalue to make it scale-invariant
-    threshold = tol * np.max(evals_G)
-    valid_mask = evals_G > threshold
-
-    evals_G_r = evals_G[valid_mask]
-    evecs_G_r = evecs_G[:, valid_mask]
-    rank = len(evals_G_r)
-
-    # 4. Construct the whitening transformation matrix (T) for the stable subspace
-    # T projects into a space where the metric is the Identity matrix
-    T = evecs_G_r @ np.diag(1.0 / np.sqrt(evals_G_r))
-
-    # 5. Project the penalty matrix 'omega' into this whitened, well-conditioned subspace
-    omega_proj = T.T @ omega @ T
-
-    # 6. Solve the Standard (not Generalized) Eigenvalue Problem in the projected space
-    s, Z = np.linalg.eigh(omega_proj)
-
-    # 7. Map the eigenvectors back to the original coefficient space
-    V = T @ Z
-
-    # 8. Sort eigenvalues and eigenvectors in descending order
-    idx = np.argsort(s)[::-1]
-    s = np.maximum(s[idx], 0)
-    V = V[:, idx]
-
-    # 9. Construct the orthonormal basis U in the original space
-    U = B @ V
-    return {'U': U, 'V': V, 's': s, 'rank': rank}
-
-def orthogonalize_basis(B, omega):
-    """
-    Optimized simultaneous diagonalization using Generalized Eigenvalue Decomposition.
-    - U = B @ V
-    - U.T @ U = Identity
-    - V.T @ omega @ V = diag(s)
-    """
-    # 1. Form the overlap matrix (Metric) S = B.T @ B
-    # Complexity: O(m * n^2) - This is usually the bottleneck
-    G = B.T @ B
-    # L = np.linalg.cholesky(G @ G.T)
-    # print('Stability', np.linalg.det(L))
-
-    # 3. Add regularization to the diagonal of G in-place to save memory
-    n_col = G.shape[1]
-    eps = np.sqrt(np.finfo(float).eps) * np.trace(G) / n_col
-    np.fill_diagonal(G, G.diagonal() + eps)
-
-    # 2. Solve the Generalized Eigenvalue Problem: omega @ V = G @ V @ diag(s)
-    # eigh with 'b' argument returns V such that V.T @ G @ V = I
-    # This automatically satisfies (B @ V).T @ (B @ V) = I
-    s, V = eigh(omega, G)
-
-    # 3. Sort eigenvalues in descending order
-    idx = np.argsort(s)[::-1]
-    s = s[idx]
-    V = V[:, idx]
-    s = np.maximum(s, 0)
-
-    return {'V': V, 's': s}
-
 def compute_G(B_s):
     G = B_s.T @ B_s
     n_col = G.shape[1]
@@ -222,7 +147,7 @@ def compute_G(B_s):
     np.fill_diagonal(G, G.diagonal() + eps)
     return G
 
-def orthogonalize_basis_fast(G, omega, k=None, mode='PDE'):
+def orthogonalize_basis_fast(G, omega, k=None):
     """
     Lets LAPACK handle the GEVP using the precomputed G matrix.
     This entirely avoids Python-level dense matrix multiplication overhead.
@@ -235,18 +160,15 @@ def orthogonalize_basis_fast(G, omega, k=None, mode='PDE'):
     else:
         subset_by_index = None
     s_raw, V = eigh(omega, G, subset_by_index=subset_by_index)
-    if mode == 'ACTION':
-        s = s_raw ** 2
-    else:
-        s = np.maximum(s_raw, 0)
 
     # 2. Sort eigenvalues and eigenvectors in descending order
-    idx = np.argsort(s)[::-1]
-    s = np.maximum(s[idx], 0)
+    idx = np.argsort(s_raw)[::-1]
+    s_raw = s_raw[idx]
+    # s_raw = np.maximum(s_raw, 0)
     V = V[:, idx]
 
     # 3. Construct the orthonormal basis U
-    return {'V': V, 's': s}
+    return {'V': V, 's_raw': s_raw}
 
 def orthogonalize_basis_opt(L_inv, omega_std):
     """
@@ -269,7 +191,9 @@ def orthogonalize_basis_opt(L_inv, omega_std):
     return {'V': V, 's': s}
 
 def gsj_est(y):
+
     """
+    TODO!!!!!
     Gasser-Sroka-Jennrich (GSJ) Noise Variance Estimator.
     Computes a differencing estimator for sigma^2.
     """
@@ -286,10 +210,40 @@ def gsj_est(y):
     return np.sqrt(sigma_sq)
 
 
+from scipy.spatial import cKDTree
+
+
+def gsj_est_2d_scattered(X, y):
+    """
+    Nearest-neighbor variance estimator for unstructured 2D/3D data.
+    X: array of shape (N, 2)
+    y: array of shape (N,)
+    """
+    X = np.asarray(X)
+    y = np.asarray(y)
+    n = len(y)
+
+    # Build a spatial tree to quickly find nearest neighbors
+    tree = cKDTree(X)
+
+    # k=2 because the 1st nearest neighbor is the point itself (distance 0)
+    _, indices = tree.query(X, k=2)
+    neighbor_idx = indices[:, 1]
+
+    # Difference between point and its closest neighbor.
+    # Division by sqrt(2) normalizes the variance (since Var(e_1 - e_2) = 2*sigma^2)
+    res = (y - y[neighbor_idx]) / np.sqrt(2)
+
+    # Calculate variance
+    sigma_sq = np.sum(res ** 2) / n
+    return np.sqrt(sigma_sq)
+
+
 def compute_sure(y, fhatps, shrinkage_matrix, sig2):
     """
     Vectorized computation of Stein's Unbiased Risk Estimate (SURE).
     """
+    # TODO: Ensure fhatps = shrinkage_matrix @ y + b
     # 1. Residual Sum of Squares (RSS) for every lambda
     # fhatps is (n, n_lambda), y is (n,)
     # We compute col-wise: sum((y - fhat_j)^2)
@@ -356,7 +310,7 @@ def fit_ewa_spectral(B_ty, sum_y2, V, s, lam_vec, prior, gamma_c, sig2_est):
         "trace_hat": trace_hat
     }
 
-def fit_ewa_helper(U, y_fit, s, lam_vec, prior, gamma_c, sig2_est):
+def fit_ewa_helper(U, y_fit, s, lam_vec, prior, gamma_c, sig2_est, force_proj=None):
     """
     1. ridge shrinkage
     2. SURE
@@ -366,30 +320,38 @@ def fit_ewa_helper(U, y_fit, s, lam_vec, prior, gamma_c, sig2_est):
     fhat_ewa = fhat_ewa @ weight
     """
     # 1. Project y into the orthogonal space: U'y (Size: p)
-    Uty = U.T @ y_fit
-
     # 2. Compute Ridge Path (fhatps)
     # shrinkage_matrix is (p, n_lambda)
+    Uty = U.T @ y_fit
     shrinkage_matrix = 1.0 / (1.0 + s[:, np.newaxis] * lam_vec[np.newaxis, :])
 
     # coefficients in U-space: (p, n_lambda)
     # We multiply Uty (p,) across columns of shrinkage_matrix
-    alpha_hat = shrinkage_matrix * Uty[:, np.newaxis]
+    # 1. Apply the Affine Forcing Offset
+    # TODO: CHECK!!!!!
+    if force_proj is not None:
+        num = Uty[:, np.newaxis] + lam_vec[np.newaxis, :] * force_proj[:, np.newaxis]
+        alpha_hat = shrinkage_matrix * num
+    else:
+        alpha_hat = shrinkage_matrix * Uty[:, np.newaxis]
 
     # fhatps is (n, n_lambda). Memory Warning: 10M x 100 is ~8GB
-    fhatps = U @ alpha_hat
+    fhatps = U @ alpha_hat # y_pred
 
     # 3. Compute SURE for all lambdas
-    sure_est = compute_sure(y_fit, fhatps, shrinkage_matrix, sig2_est)
-
     # 4. EWA weights and fitted values for each gamma_c
+    sure_est = compute_sure(y_fit, fhatps, shrinkage_matrix, sig2_est) #TODO: IS SURE still correct after adding force term?
     gamma = gamma_c * sig2_est
     weights = ewa_weights(sure_est, prior, gamma)
 
     shrink_weight = (shrinkage_matrix @ weights.T).flatten()
-    A = (U * shrink_weight) @ U.T
-    fhat_ewa = A @ y_fit
-    theta_hat = Uty * shrink_weight
+    #A = (U * shrink_weight) @ U.T
+    trace_hat = np.sum(shrink_weight)
+    # fhat_ewa = (U * shrink_weight) @ Uty # A @ y_fit
+    # theta_hat = Uty * shrink_weight
+    # TODO: ??
+    fhat_ewa = fhatps @ weights
+    theta_hat = alpha_hat @ weights
 
     return {
         "fhatps": fhatps,
@@ -398,19 +360,19 @@ def fit_ewa_helper(U, y_fit, s, lam_vec, prior, gamma_c, sig2_est):
         "weights": weights,
         "fhat_ewa": fhat_ewa, # A @ Y_fit
         'theta_hat': theta_hat,
-        'hat_matrix': A,
+        'trace_hat': trace_hat,
         'shrink_weight': shrink_weight,
         'Uty': Uty
     }
 
 def fit_ewa(y, ftrue, U, V, s, lam, prior, # B_s, a, b, int_knots deg=3, deriv_order=2
-            sig_eps_est, gamma_mult=8):
+            sig_eps_est, gamma_mult=8, force_proj=None):
     """
     Implementation of the EWA spline fitting logic.
     """
 
     # 2. Precompute projections in orthogonal space
-    fit_res = fit_ewa_helper(U, y, s, lam, prior, gamma_mult, sig2_est=sig_eps_est ** 2)
+    fit_res = fit_ewa_helper(U, y, s, lam, prior, gamma_mult, sig2_est=sig_eps_est ** 2, force_proj=force_proj)
 
     # Calculate MSE if ftrue is provided (matching R's placeholder logic)
     mse_est = {}
@@ -617,3 +579,88 @@ def tensor_prod(*vectors):
 
     # 3. Flatten the spatial axes into a single axis, leaving the last dimension intact
     return out.reshape(-1, n)
+
+
+def contour_plot(X, Y, Z, fig=None, ax=None, vmin=None, vmax=None, cbar=True, **kwargs):
+    # 3. Plot the 2D Z array directly
+    # Note: x and y tick labels can be specified using xticklabels and yticklabels
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(6, 5))
+    norm = Normalize(vmin=vmin, vmax=vmax)
+    ax.contourf(X, Y, Z, cmap=CMAP, norm=norm)
+    if cbar:
+        sm = map_color(vmin, vmax)
+        fig.colorbar(sm, ax=ax)
+    return fig, ax
+
+def norm_color(vmin, vmax):
+    return Normalize(vmin=vmin, vmax=vmax)
+
+def map_color(vmin, vmax):
+    norm = norm_color(vmin=vmin, vmax=vmax)
+    return ScalarMappable(norm, cmap=CMAP)
+
+
+def tensor_diagnostics(F_tensor, tol=1e-12):
+    """
+    Computes statistics for every conditional slice of an N-dimensional tensor.
+    For a shape (3,5,7,9), this computes exactly 24 sets of statistics.
+    """
+    ndim = F_tensor.ndim
+    shape = F_tensor.shape
+
+    # Store the 24 statistics in a dictionary mapped by (Axis, Index)
+    tstats = {}
+
+    for axis in range(ndim):
+        axis_length = shape[axis]
+        for index in range(axis_length):
+
+            sub_tensor = np.take(F_tensor, indices=index, axis=axis)
+
+            # 2. Compute the requested statistics on this specific slice
+            # L2 Norm (Energy of the cross-section)
+            energy = np.linalg.norm(sub_tensor)
+            max_amp = np.max(np.abs(sub_tensor))
+            sparsity = np.sum(np.abs(sub_tensor) < tol) / sub_tensor.size
+
+            # Store it
+            tstats[(axis, index)] = {
+                'energy': energy,
+                'max_amp': max_amp,
+                'sparsity': sparsity
+            }
+        # 3. Axis-level diagnostics
+        # energy_variance = np.var(axis_energies) / (np.mean(axis_energies) ** 2 + 1e-16)
+        # print(f"  -> Energy Coefficient of Variation across Dim {axis}: {energy_variance:.4f}")
+    tstats = pd.DataFrame(tstats).T.rename_axis(['dim', 'idx'])
+    return tstats
+
+def format_latex_name(op_key, axis_names = ['x', 'y', 'z', 'w']):
+    """
+    Translates the raw operator tuples directly into a LaTeX math string.
+    Example: ((0, 0, 2), (1, 2), (0, 1, 1, 1, 2)) -> "$u_{xxz} u_{yz} u_{xyyyz}$"
+    """
+
+    # Fallback for string names (e.g., 'u_xx')
+    assert isinstance(op_key, (list, tuple))
+    # Handle the base case 'u' (empty tuple)
+    if len(op_key) == 0:
+        return "$u$"
+
+    # Wrap an isolated factor like (0,0,2) into ((0,0,2),) to standardize the loop
+
+    if isinstance(op_key[0], int):
+        op_key = (op_key,)
+
+    terms = []
+    for term_axes in op_key:
+        if len(term_axes) == 0:
+            terms.append("u")
+        else:
+            # Direct 1-to-1 mapping of the integer to the axis letter
+            assert all(i < len(axis_names) for i in term_axes), "Axis index exceeds available axis names."
+            subscript = "".join([axis_names[i] for i in term_axes])
+            terms.append(f"u_{{{subscript}}}")
+
+    return "$" + " ".join(terms) + "$"
