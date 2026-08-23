@@ -27,127 +27,27 @@ def parallel(func, iterable, n_jobs=-1, disable_par=False, **kwargs):
     return results
 
 
-def project_to_bspline(y, x, s=0, k=3):
-    tck = splrep(x, y, s=s, k=k)
-    y_fit = splev(x, tck)
-    return y_fit
+def perturb_diag(A):
+    A2 = A.copy()
+    n_col = A.shape[1]
+    eps = np.sqrt(np.finfo(float).eps) * np.trace(A) / n_col
+    np.fill_diagonal(A2, A.diagonal() + eps)
+    return A2, eps
 
 
-def compute_spline_integral_gl(all_knots, u, v, deg, x_eval=None):
-    """
-    Optimized vector-constructed calculation of the 1D spline derivative integral.
-    Handles non-uniform knot sequences exactly using vectorized Gauss-Legendre quadrature.
+def perturb_B_svd(B, eps):
+    # Decompose the original B
+    U, s, Vt = np.linalg.svd(B, full_matrices=False)
 
-    Parameters:
-    -----------
-    all_knots : array-like
-        The complete knot vector (including padded boundary knots).
-    u, v : int
-        Derivative orders.
-    deg : int
-        Spline polynomial degree.
-    x_eval : array-like, optional
-        Custom evaluation points or interval boundaries. If None, integrates over
-        the entire internal knot domain.
-    """
-    # 1. Setup full padded knot vector
-    n_basis = len(all_knots) - deg - 1
+    # Add epsilon to the squared singular values, then take the square root
+    s2 = np.sqrt(s ** 2 + eps)
 
-    # 2. Extract unique knot boundaries to identify individual spans
-    internal_knots = all_knots[deg:-deg]
+    # Reconstruct B2
+    B2 = (U * s2) @ Vt
+    return B2
 
-    if x_eval is None:
-        unique_knots = internal_knots
-    else:
-        x_eval = np.asarray(x_eval)
-        # Restrict internal knots to the range of x_eval to avoid creating empty outer spans
-        x_min, x_max = x_eval.min(), x_eval.max()
-        relevant_knots = internal_knots[(internal_knots >= x_min) & (internal_knots <= x_max)]
 
-        # The union ensures we respect both x_eval intervals and spline knot boundaries
-        unique_knots = np.unique(np.concatenate([x_eval, relevant_knots]))
-
-    x_L = unique_knots[:-1]
-    x_R = unique_knots[1:]
-
-    # 3. Generate baseline Gauss-Legendre quadrature points on [-1, 1]
-    n_quad = max(1, deg + 1)
-    quad_x, quad_w = np.polynomial.legendre.leggauss(n_quad)
-
-    # 4. Vectorized scaling transformation to local non-uniform intervals
-    widths = x_R - x_L
-    midpoints = x_R + x_L
-
-    x_pts = 0.5 * widths[:, None] * quad_x[None, :] + 0.5 * midpoints[:, None]
-    w_pts = 0.5 * widths[:, None] * quad_w[None, :]
-
-    # Flatten arrays to perform a single unified evaluation pass
-    x_flat = x_pts.ravel()
-    w_flat = w_pts.ravel()
-
-    # 5. Continuous evaluation of all basis functions simultaneously
-    c = np.eye(n_basis)
-    spl = BSpline(all_knots, c, deg)  # TODO:, extrapolate=False)
-
-    vals_u = spl(x_flat, nu=u)
-    vals_v = vals_u if u == v else spl(x_flat, nu=v)
-
-    # Clean up any NaN limits produced precisely at the right domain boundary 'b'
-    # vals_u = np.nan_to_num(vals_u)
-    # vals_v = np.nan_to_num(vals_v)
-
-    # 6. Contract across the flattened quadrature dimensions
-    omega = np.einsum('k,ki,kj->ij', w_flat, vals_u, vals_v)
-    return omega
-
-def compute_spline_integral_simp(all_knots, u=2, v=2, deg=3):
-    """
-    Computes the integral of the product of the u-th and v-th derivatives
-    of B-spline basis functions: integral[ B_i^(u)(x) * B_j^(v)(x) dx ]
-    """
-    p = int(deg)
-    u, v = int(u), int(v)
-
-    if max(u, v) > p:
-        raise ValueError(f"Derivative orders ({u}, {v}) cannot exceed degree {p}")
-
-    # 1. Construct full knot vector
-    n_basis = len(all_knots) - p - 1
-
-    # 2. Quadrature Setup (Filter zero-length intervals)
-    # Generate quadrature points and Simpson weights
-    intervals = np.diff(all_knots)
-    xtilde = np.repeat(all_knots[:-1], 3) + np.tile([0, 0.5, 1], len(intervals)) * np.repeat(intervals, 3)
-    wts = np.repeat(intervals, 3) * np.tile([1 / 6, 4 / 6, 1 / 6], len(intervals))
-
-    # 3. Construct Design Matrices for both derivative orders
-    # Bu: (n_quad_points x n_basis) matrix of u-th derivatives
-    # Bv: (n_quad_points x n_basis) matrix of v-th derivatives
-    Bu = np.zeros((len(xtilde), n_basis))
-    Bv = np.zeros((len(xtilde), n_basis))
-
-    for i in range(n_basis):
-        coeffs = np.zeros(n_basis)
-        coeffs[i] = 1.0
-        tck = (all_knots, coeffs, p)
-
-        Bu[:, i] = splev(xtilde, tck, der=u)
-        Bv[:, i] = splev(xtilde, tck, der=v)
-
-    # 4. Weighted Inner Product
-    # Equivalent to: Omega_ij = sum_k [ Bu_ik * Bv_jk * wts_k ]
-    # Using matrix notation: Bu^T @ diag(W) @ Bv
-    Omega_uv = (Bu.T * wts) @ Bv
-    return Omega_uv
-
-def compute_G(B_s):
-    G = B_s.T @ B_s
-    n_col = G.shape[1]
-    eps = np.sqrt(np.finfo(float).eps) * np.trace(G) / n_col
-    np.fill_diagonal(G, G.diagonal() + eps)
-    return G
-
-def orthogonalize_basis_fast(G, omega, k=None):
+def orthogonalize_basis_fast(G_perturb, omega, k=None):
     """
     Lets LAPACK handle the GEVP using the precomputed G matrix.
     This entirely avoids Python-level dense matrix multiplication overhead.
@@ -155,40 +55,32 @@ def orthogonalize_basis_fast(G, omega, k=None):
 
     # 1. Solve GEVP directly (LAPACK's dsygvd handles Cholesky and symmetry in C/Fortran)
     if k is not None:
-        N = G.shape[0]
+        N = G_perturb.shape[0]
         subset_by_index = [N - k, N - 1]
     else:
         subset_by_index = None
-    s_raw, V = eigh(omega, G, subset_by_index=subset_by_index)
 
-    # 2. Sort eigenvalues and eigenvectors in descending order
-    idx = np.argsort(s_raw)[::-1]
-    s_raw = s_raw[idx]
+    # s_raw, V = eigh(omega, G_perturb, subset_by_index=subset_by_index)
+    #
+    # # 2. Sort eigenvalues and eigenvectors in descending order
+    # idx = np.argsort(s_raw)[::-1]
+    # s_raw = s_raw[idx]
+    # # s_raw = np.maximum(s_raw, 0)
+    # V = V[:, idx]
+
+    omega_norm = np.trace(omega) / omega.shape[0]
+    G_norm = np.trace(G_perturb) / G_perturb.shape[0] # Makes V close to 1
+    s_raw, V = eigh(omega / omega_norm, G_perturb / G_norm, subset_by_index=subset_by_index)
+
+    idx2 = np.argsort(s_raw)[::-1]
+    s_raw = s_raw[idx2]
     # s_raw = np.maximum(s_raw, 0)
-    V = V[:, idx]
+    V = V[:, idx2]
+    s_raw = s_raw * omega_norm / G_norm
+    V = V / np.sqrt(G_norm)
 
     # 3. Construct the orthonormal basis U
     return {'V': V, 's_raw': s_raw}
-
-def orthogonalize_basis_opt(L_inv, omega_std):
-    """
-    Lets LAPACK handle the GEVP using the precomputed G matrix.
-    This entirely avoids Python-level dense matrix multiplication overhead.
-    """
-    import time
-    omega_std = (omega_std + omega_std.T) / 2.0
-    t0 = time.time()
-    s, W = eigh(omega_std)
-    t1 = time.time()
-    print(f'Eigh: {t1-t0}')
-
-    # 2. Sort eigenvalues and eigenvectors in descending order
-    idx = np.argsort(s)[::-1]
-    s = np.maximum(s[idx], 0)
-    V = L_inv.T @ W
-    V = V[:, idx]
-    # 3. Construct the orthonormal basis U
-    return {'V': V, 's': s}
 
 def gsj_est(y):
 
@@ -264,51 +156,12 @@ def ewa_weights(sure, prior, gamma):
     Log-sum-exp stabilized EWA weights.
     """
     # Use log space to prevent underflow/overflow
+    prior=1
     log_w = -sure / gamma + np.log(prior)
     log_w -= np.max(log_w)  # Stabilization
     w = np.exp(log_w)
     return w / np.sum(w)
 
-
-def fit_ewa_spectral(B_ty, sum_y2, V, s, lam_vec, prior, gamma_c, sig2_est):
-    """
-    Ultra-fast Spectral EWA. Executes purely in the K-dimensional orthogonal space.
-    Completely avoids computing U, fhatps, or the N x N Hat Matrix.
-    """
-    # 1. Project y into frequency space: V^T @ (B_s^T @ y)
-    Uty = V.T @ B_ty
-    Uty_sq = Uty ** 2
-
-    # 2. Base RSS (variance orthogonal to the basis)
-    rss_base = max(0.0, sum_y2 - np.sum(Uty_sq))
-
-    # 3. Vectorized SURE calculation across all lambdas
-    shrinkage_matrix = 1.0 / (1.0 + s[:, None] * lam_vec[None, :])
-    shrink_inv = 1.0 - shrinkage_matrix
-
-    rss_j = rss_base + np.sum(Uty_sq[:, None] * (shrink_inv ** 2), axis=0)
-    df_j = np.sum(shrinkage_matrix, axis=0)
-
-    sure_est = rss_j + 2.0 * sig2_est * df_j
-
-    # 4. EWA Weights
-    gamma = gamma_c * sig2_est
-    weights = ewa_weights(sure_est, prior, gamma)
-
-    # 5. Extract optimal coefficients
-    shrink_weight = (shrinkage_matrix @ weights.T).flatten()
-    theta_hat = Uty * shrink_weight
-
-    # The trace of the hat matrix is mathematically exactly the sum of the weights
-    trace_hat = np.sum(shrink_weight)
-
-    return {
-        "lam_best": lam_vec[np.argmax(weights)],
-        "weights": weights,
-        "theta_hat": theta_hat,
-        "shrink_weight": shrink_weight,
-        "trace_hat": trace_hat
-    }
 
 def fit_ewa_helper(U, y_fit, s, lam_vec, prior, gamma_c, sig2_est, force_proj=None):
     """
@@ -322,25 +175,22 @@ def fit_ewa_helper(U, y_fit, s, lam_vec, prior, gamma_c, sig2_est, force_proj=No
     # 1. Project y into the orthogonal space: U'y (Size: p)
     # 2. Compute Ridge Path (fhatps)
     # shrinkage_matrix is (p, n_lambda)
+    assert (lam_vec.min() >= 0) and (lam_vec.max() <= 1)
     Uty = U.T @ y_fit
-    shrinkage_matrix = 1.0 / (1.0 + s[:, np.newaxis] * lam_vec[np.newaxis, :])
+    shrinkage_matrix = 1.0 / (1.0 + (s[:, np.newaxis] - 1) * lam_vec[np.newaxis, :])
+    assert shrinkage_matrix.min() > 0
 
-    # coefficients in U-space: (p, n_lambda)
-    # We multiply Uty (p,) across columns of shrinkage_matrix
-    # 1. Apply the Affine Forcing Offset
-    # TODO: CHECK!!!!!
     if force_proj is not None:
-        num = Uty[:, np.newaxis] + lam_vec[np.newaxis, :] * force_proj[:, np.newaxis]
-        alpha_hat = shrinkage_matrix * num
+        num = Uty[:, np.newaxis] + lam_vec[np.newaxis, :] * (force_proj - Uty)[:, np.newaxis]
     else:
-        alpha_hat = shrinkage_matrix * Uty[:, np.newaxis]
+        num = (1 - lam_vec)[np.newaxis, :] * Uty[:, np.newaxis]
 
+    alpha_hat = shrinkage_matrix * num
     # fhatps is (n, n_lambda). Memory Warning: 10M x 100 is ~8GB
     fhatps = U @ alpha_hat # y_pred
 
-    # 3. Compute SURE for all lambdas
     # 4. EWA weights and fitted values for each gamma_c
-    sure_est = compute_sure(y_fit, fhatps, shrinkage_matrix, sig2_est) #TODO: IS SURE still correct after adding force term?
+    sure_est = compute_sure(y_fit, fhatps, shrinkage_matrix, sig2_est)
     gamma = gamma_c * sig2_est
     weights = ewa_weights(sure_est, prior, gamma)
 
@@ -349,9 +199,11 @@ def fit_ewa_helper(U, y_fit, s, lam_vec, prior, gamma_c, sig2_est, force_proj=No
     trace_hat = np.sum(shrink_weight)
     # fhat_ewa = (U * shrink_weight) @ Uty # A @ y_fit
     # theta_hat = Uty * shrink_weight
-    # TODO: ??
     fhat_ewa = fhatps @ weights
-    theta_hat = alpha_hat @ weights
+    alpha_ewa = alpha_hat @ weights
+
+    c_diag = shrinkage_matrix @ (lam_vec * weights)
+    M_diag = shrink_weight - c_diag
 
     return {
         "fhatps": fhatps,
@@ -359,10 +211,11 @@ def fit_ewa_helper(U, y_fit, s, lam_vec, prior, gamma_c, sig2_est, force_proj=No
         "sure_est": sure_est,
         "weights": weights,
         "fhat_ewa": fhat_ewa, # A @ Y_fit
-        'theta_hat': theta_hat,
+        'theta_hat': alpha_ewa,
         'trace_hat': trace_hat,
         'shrink_weight': shrink_weight,
-        'Uty': Uty
+        'Uty': Uty,
+        'M_diag_alpha': M_diag,
     }
 
 def fit_ewa(y, ftrue, U, V, s, lam, prior, # B_s, a, b, int_knots deg=3, deriv_order=2
@@ -384,10 +237,14 @@ def fit_ewa(y, ftrue, U, V, s, lam, prior, # B_s, a, b, int_knots deg=3, deriv_o
     lam_best = lam[best_idx]
 
     beta = V @ fit_res['theta_hat']
+    rss = np.sum((fhat_ewa - y) ** 2)
+    sigma_est = np.sqrt(rss / (len(y) - fit_res['trace_hat']))
+
     return {
         "mse_est": mse_est, # OK!
         "lam_best": lam_best,  # OK!
         "beta": beta,
+        'sigma_est': sigma_est,
         **fit_res
     }
 
@@ -513,51 +370,6 @@ def mvn_pairplot(mu, sigma, title='MVN Density Pairplot',
                  y=0.99, fontsize=13, fontweight='bold', color='midnightblue')
     plt.tight_layout()
     return fig, axes
-
-#
-# def fit_ewa_helper2(U, y_fit, s, lam_vec, prior, gamma_c, sig2_est):
-#     """
-#     Optimized SURE computation.
-#     Completely avoids generating the (p, n_lambda) shrinkage matrix
-#     and the (N, n_lambda) prediction matrix.
-#     """
-#     # Ensure 1D arrays to prevent accidental 2D broadcasting behaviors
-#     y_fit = y_fit.ravel()
-#
-#     # 1. Project y into the orthogonal space: O(N * p)
-#     # This is the ONLY time we interact with the massive N dimension.
-#     Uty = (U.T @ y_fit).ravel()
-#
-#     # 2. Precompute constants independent of lambda
-#     Uty_sq = Uty ** 2
-#
-#     # Compute base RSS: ||y_perp||^2 = ||y||^2 - ||U^Ty||^2
-#     # max(0, ...) is used to safeguard against tiny negative values from float imprecision
-#     rss_base = max(0.0, np.sum(y_fit ** 2) - np.sum(Uty_sq))
-#
-#     n_lam = len(lam_vec)
-#     sure_est = np.zeros(n_lam)
-#
-#     # 3. Compute SURE for each lambda using a low-memory loop: O(p * n_lambda)
-#     for j, lam in enumerate(lam_vec):
-#         # Shrinkage vector for current lambda ONLY (Size: p)
-#         # S_j = 1 / (1 + s * lam)
-#         shrinkage_j = 1.0 / (1.0 + s * lam)
-#
-#         # (1 - S_j)
-#         shrink_inv_j = 1.0 - shrinkage_j
-#
-#         # RSS_j = ||y_perp||^2 + sum( (Uty * (1 - S_j))^2 )
-#         rss_j = rss_base + np.sum(Uty_sq * (shrink_inv_j ** 2))
-#
-#         # Effective degrees of freedom: sum( S_j )
-#         df_j = np.sum(shrinkage_j)
-#
-#         # Compute final SURE for this lambda
-#         sure_est[j] = rss_j + 2.0 * sig2_est * df_j
-#
-#     return sure_est
-
 
 def tensor_prod(*vectors):
     n = len(vectors)
