@@ -22,7 +22,8 @@ def run_pde_experiment(
         dim,
         variables,
         pde_params,
-        true_sol_func,
+        true_sol_with_derivatives,
+        boundary_conditions,
         setup_config_func,
         x_max_size=1_000_000,
         oversample=100
@@ -80,9 +81,11 @@ def run_pde_experiment(
     grids = [np.linspace(*d, grid_size_1d) for d in domain]
     x = tensor_prod(*grids)
 
-    y = true_sol_func(x, **params)
+    y_derivs = true_sol_with_derivatives(x, **params)
+    y = next(iter(y_derivs.values()))
     sigma_scaled = np.std(y) * sigma_frac
 
+    bc_dict = boundary_conditions(**params, domain=domain)
     kwargs = action_kwargs if action else pde_kwargs
 
     def run_one(i):
@@ -99,8 +102,10 @@ def run_pde_experiment(
         index_test = rng.choice(range(len(x)), n)
         index_test = np.sort(index_test)
         x_test, y_test, e_test = x[index_test], y_noise[index_test], noise[index_test]
+        dataset = pd.DataFrame({'x': x_train[:,0], 'y': x_train[:, 1], 'z': y_train})
+
         print(f"True Sigma: {sigma_scaled}")
-        model = EWABSplinePDE(dim=dim, variables=variables, domain=domain,
+        model = EWABSplinePDE(dim=dim, variables=variables, domain=domain, boundary_conditions=bc_dict,
                               alpha=alpha, quantile_based=quantile_based, num_int_knots=num_int_knots,
                               total_grid_size=10000, norm_omega=False,
                               sigma=None, #sigma_scaled, #TODO!!!!!
@@ -134,6 +139,9 @@ def run_pde_experiment(
             res_series[f'coef_var_{idx_r}_{idx_c}'] = coef_var[idx_r, idx_c]
 
         if debug:
+            # model.plot_fit_stats()
+            # model.galerkin_force_diagnostics()
+            # model.galerkin_penalty_diagnostics()
             model.plot_basis_functions()
 
             # Plot True Solution (If 2D)
@@ -150,10 +158,13 @@ def run_pde_experiment(
                 plt.show()
 
             # Plot Fitted
-            model.plot_fit(show_ci=True, x_test=x_test, y_test=y_test)
+            model.plot_fit(x_test=x_test, y_test=y_test)
             plt.show()
             print(res_series)
 
+            model.plot_derivatives(deriv_orders_list=[(0, 0), (1, 0), (0, 1), (2, 0), (1,1), (0, 2)],
+                                   true_deriv_func=true_sol_with_derivatives,
+                                   true_deriv_kwargs=params)
         return res_series
 
     t0 = time.time()

@@ -13,25 +13,48 @@ VARIABLES = ['x', 'y']
 # --- Experiment Parameters ---
 PDE_PARAMS = {
     'p_a': {'flag': 'anisotropy', 'type': float, 'default': 3},
-    'p_K': {'flag': 'amplitude', 'type': float, 'default': 1.},
-    'p_m': {'flag': 'freq_x', 'type': float, 'default': 3.},
-    'p_n': {'flag': 'freq_y', 'type': float, 'default': 4.},
+    'p_K': {'flag': 'amplitude', 'type': float, 'default': 100.},
+    'p_m': {'flag': 'freq_x', 'type': float, 'default': 5.},
+    'p_n': {'flag': 'freq_y', 'type': float, 'default': 2.},
     'p_L': {'flag': 'bound_x', 'type': float, 'default': 2 * np.pi},
     'p_H': {'flag': 'bound_y', 'type': float, 'default': np.pi}
 }
 
-
-def true_sol(x, p_a, p_m, p_n, p_K, p_L, p_H):
+def true_sol_derivatives(x, p_a, p_m, p_n, p_K, p_L, p_H):
     """
-    Generalized Poisson on [0, L] x [0, H]:
-    u_xx + a^2 u_yy = g
-    g(x, y) = K cos(m pi x / L) cos(n pi y / H)
-    Dirichlet BC: du=0 on dOmega
+    Calculates the exact analytical partial derivatives up to order 2
+    for the Generalized Poisson solution:
+    u_xx + a^2 u_yy = K cos(m pi x / L) cos(n pi y / H)
+
+    Returns a dictionary mapping derivative order tuples (u, v) to evaluated arrays.
     """
     assert np.ndim(x) == 2 and x.shape[1] == 2
-    m2, n2 = p_m * np.pi / p_L, p_n * np.pi / p_H
-    return - (p_K / (m2 ** 2 + (p_a * n2) ** 2)) * np.cos(m2 * x[:, 0]) * np.cos(n2 * x[:, 1])
 
+    X1 = x[:, 0]
+    X2 = x[:, 1]
+
+    # Scaled frequencies
+    m2 = p_m * np.pi / p_L
+    n2 = p_n * np.pi / p_H
+
+    # Precompute base trigonometric evaluations
+    cos_m2x = np.cos(m2 * X1)
+    sin_m2x = np.sin(m2 * X1)
+
+    cos_n2y = np.cos(n2 * X2)
+    sin_n2y = np.sin(n2 * X2)
+
+    # Global amplitude constant
+    c = - (p_K / (m2 ** 2 + (p_a * n2) ** 2))
+
+    derivs = {}
+    derivs[(0, 0)] = c * cos_m2x * cos_n2y
+    derivs[(1, 0)] = -c * m2 * sin_m2x * cos_n2y
+    derivs[(0, 1)] = -c * n2 * cos_m2x * sin_n2y
+    derivs[(2, 0)] = -c * (m2 ** 2) * cos_m2x * cos_n2y
+    derivs[(0, 2)] = -c * (n2 ** 2) * cos_m2x * cos_n2y
+    derivs[(1, 1)] = c * m2 * n2 * sin_m2x * sin_n2y
+    return derivs
 
 def force(x, p_m, p_n, p_K, p_L, p_H):
     """External Forcing Function g(x)"""
@@ -84,7 +107,7 @@ if __name__ == '__main__':
         dim=DIM,
         variables=VARIABLES,
         pde_params=PDE_PARAMS,
-        true_sol_func=true_sol,
+        true_sol_with_derivatives=true_sol_derivatives,
         setup_config_func=setup_config,
         x_max_size=X_MAX_SIZE,
         oversample=OVERSAMPLE,
