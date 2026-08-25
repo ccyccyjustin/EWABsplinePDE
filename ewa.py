@@ -57,8 +57,8 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
                  dim: int,
                  deg: int = 3,
                  variables: Optional[List[str]] = None,
-                 smooth: bool = True,
-                 bias_corrected: bool = True,
+                 smooth: bool = False,
+                 bias_corrected: bool = False,
                  deriv_coef: Dict[str, float] = None,
                  action_coef: Dict[tuple, float] = None,
                  force: callable = None,
@@ -87,7 +87,7 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
         self.smooth = smooth
         self.bias_corrected = bias_corrected
         self.deriv_coef = deriv_coef or {}
-        self.action_coef = action_coef or {}
+        self.action_coef = action_coef or {} #TODO: REMOVE, also self.mode
         self.force = force or (lambda s: np.zeros(s.shape[0]))
         self.boundary_conditions = boundary_conditions
         self.trainable = trainable
@@ -277,7 +277,7 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
             B_tensor = (B_tensor[:, :, None] * B_list[i][:, None, :]).reshape(X.shape[0], -1)
 
         # Base prediction using optimal EWA coefficients in the original B-spline space
-        y_hat_deriv = B_tensor @ self.ewa_res_['beta']
+        y_hat_deriv = B_tensor @ self.beta_full_
         return y_hat_deriv
 
     def _initialize_basis(self, X: np.ndarray):
@@ -330,21 +330,17 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
         self.prior_ = prior
         self.lam_grid_ = lam_grid
 
-    def compute_K_uv(self, d_u, d_v, x_eval=None):
+    def compute_K_uv(self, d_u, d_v):
         K_uv = None
         for p in range(self.dim):
             d_up = d_u[p]
             d_vp = d_v[p]
             # --- 2. Check the Local 1D Micro-Cache ---
             cache_key_1d = (p, d_up, d_vp)
-            mul = 1
             if cache_key_1d not in self._integral_1d_cache:
-                if self.smooth and (((d_up, d_vp) == (2, 0)) or ((d_up, d_vp) == (0, 2))):
-                    (d_up, d_vp) = (1, 1)
-                    mul = -1
                 self._integral_1d_cache[cache_key_1d] = compute_spline_integral_gl(
                     self.spline_objs[p], u=d_up, v=d_vp
-                ) * mul
+                )
 
             K_1d = self._integral_1d_cache[cache_key_1d]
 
@@ -355,7 +351,7 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
                 K_uv = np.kron(K_uv, K_1d)
         return K_uv
 
-    def compute_omega(self, deriv_keys, x_eval=None):
+    def compute_omega(self, deriv_keys):
         """
         First Compute u^th, and v^th order partial derivs.
         Then compute integral of their products
@@ -368,7 +364,7 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
         for u, k_u in enumerate(deriv_keys):
             for v, k_v in enumerate(deriv_keys[:u + 1]):
                 if (u, v) not in self._omega_dict:
-                    omega_uv = self.compute_K_uv(k_u, k_v, x_eval)
+                    omega_uv = self.compute_K_uv(k_u, k_v)
                     self._omega_dict[u, v] = omega_uv
                     self._omega_dict[v, u] = omega_uv.T
         return
@@ -388,7 +384,7 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
 
         for u, k_u in enumerate(deriv_keys):
             if u not in H_0_dict:
-                H_0_dict[u] = self.compute_K_uv(self._zero_deriv, k_u, x_eval)
+                H_0_dict[u] = self.compute_K_uv(self._zero_deriv, k_u)
             H_0u = H_0_dict[u]
 
             for v, k_v in enumerate(deriv_keys[:u + 1]):
@@ -527,6 +523,13 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
 
         assert np.abs(penalty_matrix - penalty_matrix.T).max() < self.tol
         penalty_matrix = (penalty_matrix + penalty_matrix.T) / 2.0
+
+        # --- 2. Hard Constrained Reduced Space Projection ---
+        if len(self.boundary_conditions) > 0:
+            A_reduced = self.T_matrix_.T @ penalty_matrix @ self.T_matrix_
+            v_reduced = self.T_matrix_.T @ (forcing_vector - penalty_matrix @ self.d_vec_)
+            return A_reduced, v_reduced
+
         return penalty_matrix, forcing_vector
 
     def compute_theta_system_pde(self, omega_dict, beta, theta,
@@ -545,7 +548,11 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
             G = beta.T @ omega_uv @ beta
             if bias_corrected:
                 M_squared = M_diag ** 2
-                K_uv = V.T @ omega_uv @ V
+                if len(self.boundary_conditions) > 0:
+                    V_proj = self.T_matrix_ @ V
+                else:
+                    V_proj = V
+                K_uv = V_proj.T @ omega_uv @ V_proj
                 bias = np.sum(np.diag(K_uv) * M_squared)
                 bias = sigma ** 2 * bias
                 print(f'Bias for {key}: {bias / G:.4%}')
@@ -591,6 +598,10 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
             coef_Tc = deriv_coef[Tc]
             G_TT = G[np.ix_(T, T)]
             G_TTc = G[np.ix_(T, Tc)]
+            if np.linalg.eigvals(G_TT).min() < self.tol:
+                logger.warning('Trainable Gram not Positive!')
+            if np.linalg.cond(G_TT) > 1 / self.tol:
+                logger.warning('Trainable Gram not Invertible!')
             c_calc = np.linalg.solve(G_TT, v_vec[T] - G_TTc @ coef_Tc)
 
         # 2. Apply Momentum / Over-Relaxation to accelerate the tail convergence
@@ -736,6 +747,20 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
         self.precompute_forcing_components()
         self.add_boundary_conditions(self.boundary_conditions)
 
+        # --- Project Data Loss into the Unconstrained Space ---
+        if len(self.boundary_conditions) > 0:
+            self.B_data_reduced_ = self.B_data_ @ self.T_matrix_
+            self.G_reduced_ = self.T_matrix_.T @ self.G_ @ self.T_matrix_
+            self.y_adj_ = y - (self.B_data_ @ self.d_vec_)
+        else:
+            self.B_data_reduced_ = self.B_data_
+            self.G_reduced_ = self.G_
+            self.y_adj_ = y
+
+        # Perturb the reduced Gram matrix to guarantee numerical stability
+        self.G_reduced_, eps = util.perturb_diag(self.G_reduced_)
+        self.B_data_reduced_perturb = util.perturb_B_svd(self.B_data_reduced_, eps)
+
         coef_vals = self._initial_coef_vals.copy()
         self.fit_stats = {}
         # --- Block Coordinate Descent for Physics Parameters ---
@@ -744,9 +769,9 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
             p_norm = np.trace(penalty_matrix)
 
             # 1. Orthogonalization via GEVP
-            orth = util.orthogonalize_basis_fast(self.G_, penalty_matrix)
+            orth = util.orthogonalize_basis_fast(self.G_reduced_, penalty_matrix)
             self.V_, self.s_raw_ = orth['V'], orth['s_raw'] #G^{-1} = VV^T
-            self.U_ = self.B_data_perturb @ self.V_
+            self.U_ = self.B_data_reduced_perturb @ self.V_
 
             # 2. Project Forcing Vector into Orthogonal Space
             force_proj = self.V_.T @ forcing_vector
@@ -754,7 +779,7 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
 
             # 3. Fit EWA Model
             self.ewa_res_ = util.fit_ewa(
-                y=y, ftrue=y, U=self.U_, V=self.V_, s=s,
+                y=self.y_adj_, ftrue=self.y_adj_, U=self.U_, V=self.V_, s=s,
                 lam=self.lam_grid_, prior=self.prior_,
                 sig_eps_est=self.sigma_est_, gamma_mult=self.gamma_mult,
                 force_proj=force_proj
@@ -762,10 +787,20 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
 
             self.sigma_est_ = self.ewa_res_['sigma_est']
 
-            gram_matrices, proj_vec, jacob = self.compute_theta_system_pde(self._omega_dict, self.ewa_res_['beta'], coef_vals,
+            # --- NEW: 4. Construct the rigid physical surrogate (\tilde{\beta}) ---
+            beta_I = self.ewa_res_['beta']
+            if len(self.boundary_conditions) > 0:
+                self.beta_full_ = self.T_matrix_ @ beta_I + self.d_vec_
+            else:
+                self.beta_full_ = beta_I
+
+            gram_matrices, proj_vec, jacob = self.compute_theta_system_pde(self._omega_dict,
+                                                                           self.beta_full_,
+                                                                           coef_vals,
                                                                            bias_corrected=self.bias_corrected,
                                                                            sigma=self.sigma_est_,
-                                                                           V=self.V_, M_diag=self.ewa_res_['M_diag_alpha'])
+                                                                           V=self.V_,
+                                                                           M_diag=self.ewa_res_['M_diag_alpha'])
             coef_mean, self.coef_var = self.get_coef_dist(gram_matrices, coef_vals, proj_vec)
 
             w = self.ewa_res_['weights']
@@ -781,8 +816,7 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
             # coef_mean = self.update_coef(coef_vals, grad, hess)
             # hess_T = np.linalg.eigvals(hess[np.ix_(self._trainable_idx, self._trainable_idx)])
 
-            coef_vals = coef_mean
-            physics_loss = self.compute_physics_loss(coef_vals, gram_matrices, proj_vec)
+            physics_loss = self.compute_physics_loss(coef_mean, gram_matrices, proj_vec)
 
             logger.info(f"Iteration {iteration} | Coefficients: {coef_mean} | "
                         f"sigma_est: {self.sigma_est_:.4e} | physics_loss: {physics_loss:.4e} | "
@@ -793,21 +827,22 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
                                                   lamb_lq, lamb_mean, lamb_uq])
 
             # 5. Check Convergence
-            # old_theta_T = coef_vals[self._trainable_idx]
-            # new_theta_T = coef_mean[self._trainable_idx]
-            # coef_pct_chg = np.abs(old_theta_T - new_theta_T).sum() / (np.abs(old_theta_T).sum() + 1e-8)
-            #
-            # if coef_pct_chg < self.min_pct_chg:
-            #     logger.info("Physics parameters converged.")
-            #     break
+            old_theta_T = coef_vals[self._trainable_idx]
+            new_theta_T = coef_mean[self._trainable_idx]
+            coef_pct_chg = np.abs(old_theta_T - new_theta_T).sum() / (np.abs(old_theta_T).sum() + 1e-8)
 
-            old_physics_loss = self.fit_stats.get(iteration - 1, [np.inf])[0]
-            loss_pct_decr = 1 - (physics_loss / old_physics_loss)
-
-            if loss_pct_decr <= self.min_pct_chg:
-                print(loss_pct_decr)
+            if coef_pct_chg < self.min_pct_chg:
                 logger.info("Physics parameters converged.")
                 break
+
+            # old_physics_loss = self.fit_stats.get(iteration - 1, [np.inf])[0]
+            # loss_pct_decr = 1 - (physics_loss / old_physics_loss)
+            #
+            # if loss_pct_decr <= self.min_pct_chg:
+            #     print(loss_pct_decr)
+            #     logger.info("Physics parameters converged.")
+            #     break
+            coef_vals = coef_mean
 
         # --- Finalize Fitted State ---
         self.deriv_coef_vals_ = coef_vals
@@ -1152,8 +1187,15 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
         X = check_array(X, ensure_2d=False)
 
         B_new = self._build_tensor_basis(X)
-        U_new = B_new @ self.V_
-        y_hat = U_new @ self.ewa_res_['theta_hat']
+
+        # Project test basis into the reduced space for correct variance propagation
+        if len(self.boundary_conditions) > 0:
+            B_new_reduced = B_new @ self.T_matrix_
+        else:
+            B_new_reduced = B_new
+
+        U_new = B_new_reduced @ self.V_
+        y_hat = B_new @ self.beta_full_
 
         # CI of the fitted function itself (excluding +1 observation noise)
         variances = np.sum((U_new ** 2) * (self.ewa_res_['shrink_weight'] ** 2)[None, :], axis=1) + 1
@@ -1355,7 +1397,11 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
 
     @property
     def basis_functions(self):
-        basis = self.B_grid_ @ self.V_
+        # Expand reduced orthogonal vectors V_ back to full grid dimensions
+        if len(self.boundary_conditions) > 0:
+            basis = self.B_grid_ @ (self.T_matrix_ @ self.V_)
+        else:
+            basis = self.B_grid_ @ self.V_
         basis_wgt = self.ewa_res_['theta_hat']
 
         basis_decomp = basis * basis_wgt[None, :]
