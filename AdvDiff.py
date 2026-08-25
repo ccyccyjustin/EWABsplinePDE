@@ -63,14 +63,21 @@ def true_sol_with_derivatives(x, p_alpha, p_v, p_a1, p_a2):
     cos1 = np.cos(np.pi * X2)
     cos2 = np.cos(2 * np.pi * X2)
 
-    derivs = {}
-    derivs[(0, 0)] = exp1 * sin1 + exp2 * sin2
-    derivs[(1, 0)] = lam1 * exp1 * sin1 + lam2 * exp2 * sin2
-    derivs[(0, 1)] = np.pi * exp1 * cos1 + 2 * np.pi * exp2 * cos2
-    derivs[(2, 0)] = (lam1 ** 2) * exp1 * sin1 + (lam2 ** 2) * exp2 * sin2
-    derivs[(0, 2)] = -(np.pi ** 2) * exp1 * sin1 - (4 * np.pi ** 2) * exp2 * sin2
-    derivs[(1, 1)] = lam1 * np.pi * exp1 * cos1 + lam2 * 2 * np.pi * exp2 * cos2
+    # 3. Assemble the fundamental base modes and their Y-derivatives
+    u1 = exp1 * sin1
+    u2 = exp2 * sin2
+    u1_y = np.pi * exp1 * cos1
+    u2_y = 2 * np.pi * exp2 * cos2
 
+    # 4. Construct the structural derivative dictionary
+    derivs = {
+        (0, 0): u1 + u2,
+        (1, 0): (lam1 * u1) + (lam2 * u2),
+        (0, 1): u1_y + u2_y,
+        (2, 0): (lam1 ** 2 * u1) + (lam2 ** 2 * u2),
+        (0, 2): -(np.pi ** 2 * u1) - (4 * np.pi ** 2 * u2),
+        (1, 1): (lam1 * u1_y) + (lam2 * u2_y)
+    }
     return derivs
 
 
