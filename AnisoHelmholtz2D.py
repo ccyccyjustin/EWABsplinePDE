@@ -48,10 +48,11 @@ def true_sol_with_derivatives(x, p_m, p_n, p_alpha, p_a1, p_a2):
     # Mode 1: Defined by the passed parameters (default m=2, n=2)
     m1_pi = p_m * np.pi
     n1_pi = p_n * np.pi
+    assert np.abs(p_m ** 2 - p_alpha * p_n ** 2) > 1e-4
 
     # Mode 2: Hardcoded to guarantee the shared eigenvalue at alpha = 0.6
-    m2_pi = 1.0 * np.pi
-    n2_pi = 3.0 * np.pi
+    m2_pi = (np.sqrt(p_alpha) * p_n) * np.pi
+    n2_pi = (p_m / np.sqrt(p_alpha)) * np.pi
 
     cos_m1x, sin_m1x = np.cos(m1_pi * X1), np.sin(m1_pi * X1)
     cos_n1y, sin_n1y = np.cos(n1_pi * X2), np.sin(n1_pi * X2)
@@ -76,7 +77,6 @@ def true_sol_with_derivatives(x, p_m, p_n, p_alpha, p_a1, p_a2):
 
     # Mixed derivative
     derivs[(1, 1)] = p_a1 * (m1_pi * n1_pi * sin_m1x * sin_n1y) + p_a2 * (m2_pi * n2_pi * cos_m2x * cos_n2y)
-
     return derivs
 
 

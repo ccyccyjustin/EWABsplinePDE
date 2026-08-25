@@ -131,6 +131,7 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
             raise ValueError("Must provide physics constraints via deriv_coef or action_coef.")
 
         self._coef_keys = [tuple(int((np.array(k) == p).sum()) for p in range(self.dim)) for k in self._coef_keys]
+        self.coef_keys = [self.format_deriv_orders(k) for k in self._coef_keys]
         self._initial_coef_vals = np.array(self._initial_coef_vals, dtype=float)
         self._zero_deriv = tuple([0] * self.dim)
         self._determine_trainable_indices()
@@ -138,6 +139,7 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
     def parse_derivative_order(self, op_key):
         """
         Parses a nonlinear PDE term into a list of derivative order vectors.
+        From a tuple of (dx_i) to a structured count of derivatives in each dimension
         Example: ((0, 0, 2), (1,2)) -> [ [2, 0, 1], [0, 1, 1] ]
         """
         factors = []
@@ -158,6 +160,22 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
             factors.append(order)
 
         return factors
+
+    def format_deriv_orders(self, deriv_order: tuple) -> str:
+        """
+        Maps a list of derivative order tuples to their string representations.
+        Relies on self.variables (e.g., ['x', 'y']).
+
+        Example input:  [(0, 0), (2, 0), (0, 2), (1, 1)]
+        Example output: ['u', 'u_xx', 'u_yy', 'u_xy']
+        """
+
+        if sum(deriv_order) == 0:
+            return "$u$"
+        else:
+            # Multiply each variable name by its derivative degree and concatenate
+            subscript = "".join(self.variables[i] * degree for i, degree in enumerate(deriv_order))
+            return f"$u_{{{subscript}}}$"
 
     def _determine_trainable_indices(self):
         """Determines which physics parameters are actively optimized."""
@@ -1340,6 +1358,7 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
 
         # --- 2D Case ---
         elif self.dim == 2:
+            xlabel, ylabel = self.variables
             X_mesh = x_grid[:, 0].reshape(self.grid_size_, self.grid_size_)
             Y_mesh = x_grid[:, 1].reshape(self.grid_size_, self.grid_size_)
 
@@ -1358,7 +1377,7 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
             sc = axes[0].scatter(x_scatter[:, 0], x_scatter[:, 1], c=data_residuals,
                                  norm=norm_res, cmap=util.CMAP, edgecolors='black', s=20)
             fig.colorbar(sc, ax=axes[0], shrink=0.8, pad=0.04)
-            axes[0].set(title="Data Residuals $(Y - \hat{Y})$", xlabel="X1", ylabel="X2")
+            axes[0].set(title="Data Residuals $(Y - \hat{Y})$", xlabel=xlabel, ylabel=ylabel)
 
             # Subplot 2: Learnt PDE Loss Heatmap
             Z_learnt = pde_loss_learnt.reshape(self.grid_size_, self.grid_size_)
@@ -1369,7 +1388,7 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
                                        cbar=False)
             sm_learnt = util.map_color(vmin=-vmax_pde, vmax=vmax_pde)
             fig.colorbar(sm_learnt, ax=axes[1], shrink=0.8, pad=0.04)
-            axes[1].set(title="Learnt PDE Pointwise Loss", xlabel="X1", ylabel="X2")
+            axes[1].set(title="Learnt PDE Pointwise Loss", xlabel=xlabel, ylabel=ylabel)
 
             # Subplot 3: True PDE Loss Heatmap
             if pde_loss_true is not None:
@@ -1381,13 +1400,13 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
                                            levels=30, cbar=False)
                 sm_true = util.map_color(vmin=-vmax_true, vmax=vmax_true)
                 fig.colorbar(sm_true, ax=axes[2], shrink=0.8, pad=0.04)
-                axes[2].set(title="True PDE Pointwise Loss", xlabel="X1", ylabel="X2")
+                axes[2].set(title="True PDE Pointwise Loss", xlabel = xlabel, ylabel = ylabel)
 
         else:
             print(f"Plotting not supported for dimension {self.dim} > 2.")
 
         # --- 5. Common Formatting ---
-        deriv_coef = {str(k): float(f"{v:.4g}") for k, v in zip(self._coef_keys, self.deriv_coef_vals_)}
+        deriv_coef = {str(k): float(f"{v:.4g}") for k, v in zip(self.coef_keys, self.deriv_coef_vals_)}
         title = (
             f"EWA Fit Diagnostics | n={len(x_scatter)} | deg={self.deg}\n"
             f"Learnt Coefs: {deriv_coef}"
@@ -1445,6 +1464,7 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
 
         # --- 2D Case: Grid of Heatmaps ---
         elif self.dim == 2:
+            xlabel, ylabel = self.variables
             grid_shape = (len(self.grids_[0]), len(self.grids_[1]))
             X1, X2 = np.meshgrid(self.grids_[0], self.grids_[1], indexing='ij')
 
@@ -1465,7 +1485,7 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
                 _, ax = util.contour_plot(X1, X2, Z, ax=ax,
                                             vmin=-global_vmax, vmax=global_vmax, levels=30, cbar=False)
                 #ax.contourf(X1, X2, Z, levels=30, cmap=util.CMAP, norm=common_norm)
-                ax.set(title=f"Basis {idx + 1} [Var: {df2.columns[idx]}]", xlabel="X1", ylabel="X2")
+                ax.set(title=f"Basis {idx + 1} [Var: {df2.columns[idx]}]", xlabel = xlabel, ylabel = ylabel)
 
             # Hide any empty subplots if n_col doesn't perfectly fill the grid
             for idx in range(n_col, rows * cols):
@@ -1588,6 +1608,7 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
 
         # --- 2D Case: Grid of Heatmaps ---
         elif self.dim == 2:
+            xlabel, ylabel = self.variables
             grid_shape = (len(self.grids_[0]), len(self.grids_[1]))
             X1, X2 = np.meshgrid(self.grids_[0], self.grids_[1], indexing='ij')
 
@@ -1595,6 +1616,7 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
                                      squeeze=False, layout='constrained')
 
             for idx, order in enumerate(deriv_orders_list):
+                order_str = self.format_deriv_orders(order)
                 base_row = (idx // cols) * (2 if plot_error else 1)
                 c = idx % cols
                 ax_pred = axes[base_row, c]
@@ -1609,7 +1631,7 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
                 _, ax_pred = util.contour_plot(X1, X2, Z, ax=ax_pred, vmin=-vmax, vmax=vmax, levels=30, cbar=False)
                 sm = util.map_color(vmin=-vmax, vmax=vmax)
                 fig.colorbar(sm, ax=ax_pred, shrink=0.8, pad=0.04)
-                ax_pred.set(title=f"Predicted {order}", xlabel="X1", ylabel="X2")
+                ax_pred.set(title=f"Predicted {order_str}", xlabel = xlabel, ylabel = ylabel)
 
                 if plot_error:
                     ax_err = axes[base_row + 1, c]
@@ -1630,7 +1652,7 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
                                                   cbar=False)
                     sm_err = util.map_color(vmin=-vmax_err, vmax=vmax_err)
                     fig.colorbar(sm_err, ax=ax_err, shrink=0.8, pad=0.04, format=mtick.StrMethodFormatter('{x:.0%}'))
-                    ax_err.set(title=f"{order} Relative Error: {Z_rel_err_norm:.4%}", xlabel="X1", ylabel="X2")
+                    ax_err.set(title=f"{order_str} Relative Error: {Z_rel_err_norm:.4%}", xlabel = xlabel, ylabel = ylabel)
 
             for idx in range(n_plots, primary_rows * cols):
                 base_row = (idx // cols) * (2 if plot_error else 1)
