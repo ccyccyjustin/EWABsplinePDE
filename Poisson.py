@@ -20,7 +20,7 @@ PDE_PARAMS = {
     'p_H': {'flag': 'bound_y', 'type': float, 'default': np.pi}
 }
 
-def true_sol_derivatives(x, p_a, p_m, p_n, p_K, p_L, p_H):
+def true_sol_with_derivatives(x, p_a, p_m, p_n, p_K, p_L, p_H):
     """
     Calculates the exact analytical partial derivatives up to order 2
     for the Generalized Poisson solution:
@@ -99,6 +99,32 @@ def setup_config(params):
     num_int_knots = required_knots_per_dim ** DIM
     return domain, PDE_KWARGS, ACTION_KWARGS, true_params, num_int_knots
 
+def get_neumann_bc_dict(domain, **kwargs):
+    """
+    Constructs the 1st-order derivative (Neumann) boundary conditions.
+    Explicitly forces the spatial coordinates to align with domain bounds.
+    """
+    # Extract the exact boundary constants from the domain definition
+    x_min, x_max = domain[0]
+    y_min, y_max = domain[1]
+
+    def force_boundary_eval(x_input, dim, fixed_val, deriv_order):
+        # Create a copy to prevent mutating the original evaluation array
+        x_exact = x_input.copy()
+        x_exact[:, dim] = fixed_val
+        return true_sol_with_derivatives(x_exact, **kwargs)[deriv_order]
+
+    bc_dict = {
+        # --- Dimension 0 (X-axis) Boundaries ---
+        ('0_min', 1): lambda x: force_boundary_eval(x, dim=0, fixed_val=x_min, deriv_order=(1, 0)),
+        ('0_max', 1): lambda x: force_boundary_eval(x, dim=0, fixed_val=x_max, deriv_order=(1, 0)),
+
+        # --- Dimension 1 (Y-axis) Boundaries ---
+        ('1_min', 1): lambda x: force_boundary_eval(x, dim=1, fixed_val=y_min, deriv_order=(0, 1)),
+        ('1_max', 1): lambda x: force_boundary_eval(x, dim=1, fixed_val=y_max, deriv_order=(0, 1))
+    }
+
+    return bc_dict
 
 if __name__ == '__main__':
     # Dispatches the physics definitions to the general testing suite
@@ -107,7 +133,8 @@ if __name__ == '__main__':
         dim=DIM,
         variables=VARIABLES,
         pde_params=PDE_PARAMS,
-        true_sol_with_derivatives=true_sol_derivatives,
+        true_sol_with_derivatives=true_sol_with_derivatives,
+        boundary_conditions=get_neumann_bc_dict,
         setup_config_func=setup_config,
         x_max_size=X_MAX_SIZE,
         oversample=OVERSAMPLE,
