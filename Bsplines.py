@@ -1,41 +1,6 @@
 import numpy as np
 from scipy.interpolate import splev, splrep, BSpline
-
-# def create_knots_(x, df=None, knots=None, degree=3, intercept=True, boundary_knots=None):
-#     """
-#     Python implementation of R's splines::bs()
-#     """
-#     assert np.ndim(x) == 1, "support 1d now..."
-#     x = np.asarray(x)
-#
-#     # 1. Determine Boundary Knots
-#     if boundary_knots is None:
-#         boundary_knots = [np.min(x), np.max(x)]
-#     else:
-#         boundary_knots = np.sort(boundary_knots)
-#
-#     # 2. Determine Internal Knots
-#     if knots is None:
-#         if df is None:
-#             # Default behavior if neither df nor knots provided
-#             int_knots = []
-#         else:
-#             # Calculate internal knots based on degrees of freedom (quantiles)
-#             # R logic: n_internal_knots = df - degree - (1 if intercept else 0)
-#             n_int_knots = df - degree - (1 if intercept else 0)
-#             if n_int_knots < 0:
-#                 raise ValueError(f"df={df} is too small for degree={degree}")
-#
-#             # Place knots at quantiles within the boundary
-#             qs = np.linspace(0, 100, n_int_knots + 2)[1:-1]
-#             int_knots = np.percentile(x, qs)
-#     else:
-#         int_knots = np.sort(knots)
-#
-#     # 3. Construct Augmented Knot Vector
-#     # We repeat the boundary knots (degree + 1) times at both ends
-#     all_knots = np.r_[np.repeat(boundary_knots[0], degree + 1), int_knots, np.repeat(boundary_knots[1], degree + 1)]
-#     return all_knots
+import scipy.sparse as sp
 
 def create_knots(int_knots, boundary_knots, degree=3):
     assert len(boundary_knots) == 2
@@ -72,6 +37,88 @@ def bs(x, spl_obj, intercept=True):
     if not intercept:
         basis_matrix = basis_matrix[:, 1:]
     return basis_matrix
+
+
+def build_custom_tensor_basis(X, spline_objs:list, dim, active_dims):
+    """
+    Generalization of tensor basis construction for subsets of dimensions.
+    """
+
+    # Evaluate 1D bases for the active dimensions
+    assert X.shape[1] == dim
+    B_list = [bs(X[:, d], spline_objs[d], intercept=True)
+              for d in active_dims]
+
+    B_tensor = B_list[0]
+    for i in range(1, len(B_list)):
+        # Row-wise Kronecker product (Khatri-Rao)
+        B_tensor = (B_tensor[:, :, None] * B_list[i][:, None, :]).reshape(X.shape[0], -1)
+
+    return B_tensor
+
+
+def _build_sparse_1d(x, knots, deg):
+    """Evaluates 1D basis strictly returning non-zero values and column indices."""
+    # knots = self.all_knots[d]
+    k = deg + 1
+    sp_mat = BSpline.design_matrix(x, knots, deg)
+
+    # Directly view active indices and weights without memory copy
+    data = sp_mat.data.reshape(-1, k)
+    indices = sp_mat.indices.reshape(-1, k)
+    return data, indices
+
+
+def build_custom_sparse_tensor_basis(X, n_splines:np.ndarray, all_knots:list, deg, dim, active_dims=None):
+    """
+    Constructs an (N, M) sparse CSR tensor basis in O(N * 16) time and O(N * 16) memory.
+    Never allocates dense arrays.
+    """
+    if active_dims is None:
+        active_dims = list(range(dim))
+
+    N = X.shape[0]
+    k = deg + 1  # 4 for cubic
+
+    if len(active_dims) == 1:
+        d = active_dims[0]
+        data, indices = _build_sparse_1d(X[:, d], all_knots[d], deg)
+        indptr = np.arange(0, N * k + 1, k, dtype=np.int32)
+        return sp.csr_matrix((data.ravel(), indices.ravel(), indptr),
+                             shape=(N, n_splines[d]))
+
+    # 2D Optimized Vectorized Kernel
+    if len(active_dims) == 2:
+        d0, d1 = active_dims[0], active_dims[1]
+        data0, idx0 = _build_sparse_1d(X[:, d0], all_knots[d0], deg)
+        data1, idx1 = _build_sparse_1d(X[:, d1], all_knots[d1], deg)
+        M1 = n_splines[d1]
+
+        # Outer product of non-zero entries: (N, 4, 1) x (N, 1, 4) -> (N, 16)
+        # Flattened directly into 1D memory buffers
+        vals = (data0[:, :, None] * data1[:, None, :]).reshape(N, -1).ravel()
+        cols = (idx0[:, :, None] * M1 + idx1[:, None, :]).reshape(N, -1).ravel()
+
+        # indptr is strictly uniform
+        k_total = k * k  # 16
+        indptr = np.arange(0, N * k_total + 1, k_total, dtype=np.int32)
+
+        M_total = n_splines[d0] * n_splines[d1]
+        return sp.csr_matrix((vals, cols, indptr), shape=(N, M_total))
+
+    # General N-D fallback
+    data_acc, idx_acc = _build_sparse_1d(X[:, active_dims[0]], all_knots[active_dims[0]], deg)
+    cols_acc = n_splines[active_dims[0]]
+    for d in active_dims[1:]:
+        data_d, idx_d = _build_sparse_1d(X[:, d], all_knots[d], deg)
+        next_cols = n_splines[d]
+        idx_acc = (idx_acc[:, :, None] * next_cols + idx_d[:, None, :]).reshape(N, -1)
+        data_acc = (data_acc[:, :, None] * data_d[:, None, :]).reshape(N, -1)
+        cols_acc *= next_cols
+
+    k_tot = data_acc.shape[1]
+    indptr = np.arange(0, N * k_tot + 1, k_tot, dtype=np.int32)
+    return sp.csr_matrix((data_acc.ravel(), idx_acc.ravel(), indptr), shape=(N, cols_acc))
 
 
 def knots_data_count(X: np.ndarray, all_knots: list, deg: int):
@@ -147,3 +194,61 @@ def compute_spline_integral_gl(spl, u, v):
     # 6. Contract across the flattened quadrature dimensions
     omega = np.einsum('k,ki,kj->ij', w_flat, vals_u, vals_v)
     return omega
+
+
+def compute_sparse_spline_integral_gl(spl, u: int = 0, v: int = 0) -> sp.csr_matrix:
+    """
+    Computes the 1D L2 inner product matrix of B-spline derivatives:
+        K_{ij} = \int D^u B_i(x) D^v B_j(x) dx
+    using vectorized Gauss-Legendre quadrature. Returns a sparse CSR matrix.
+    """
+    deg = spl.k
+    all_knots = spl.t
+    n_splines = spl.c.shape[0]
+
+    assert u <= deg and v <= deg, "Deg not sufficient for PDE!"
+
+    # 3. Extract non-empty knot intervals
+    internal_knots = all_knots[deg:-deg]
+    x_L = internal_knots[:-1]
+    x_R = internal_knots[1:]
+
+    assert len(internal_knots) > 2
+
+    # 4. Gauss-Legendre quadrature setup
+    # Exact for polynomials of degree <= (deg - u) + (deg - v) <= 2 * deg
+    n_gl = max(1, deg + 1)
+    xi, wi = np.polynomial.legendre.leggauss(n_gl)
+
+    mid = (x_L + x_R) / 2.0
+    hw = (x_R - x_L) / 2.0
+
+    # Vectorized evaluation points and weights across all intervals
+    x_pts = (mid[:, None] + hw[:, None] * xi[None, :]).ravel()
+    w_pts = (hw[:, None] * wi[None, :]).ravel()
+
+    # 5. Evaluate B-spline basis derivatives
+    Bu = spl(x_pts, nu=u)
+    Bv = Bu if u == v else spl(x_pts, nu=v)
+
+    # 6. Quadrature summation via matrix multiplication: Bu.T @ diag(w) @ Bv
+    if sp.issparse(Bu):
+        W = sp.diags(w_pts, format='csr')
+        K = Bu.T @ W @ Bv
+        if not sp.issparse(K):
+            K = sp.csr_matrix(K)
+    else:
+        K_dense = Bu.T @ (w_pts[:, None] * Bv)
+
+        # Enforce exact local support: B_i and B_j overlap only if |i - j| <= deg
+        idx_diff = np.abs(np.subtract.outer(np.arange(n_splines), np.arange(n_splines)))
+        K_dense[idx_diff > deg] = 0.0
+        K_dense[np.abs(K_dense) < 1e-15] = 0.0
+
+        if u == v:
+            K_dense = (K_dense + K_dense.T) / 2.0
+
+        K = sp.csr_matrix(K_dense)
+
+    K.eliminate_zeros()
+    return K
