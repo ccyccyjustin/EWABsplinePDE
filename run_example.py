@@ -16,6 +16,47 @@ def to_bool(arg):
     assert arg in ['0', '1']
     return True if arg == '1' else False
 
+def get_bc_dict(true_sol_with_derivatives, domain, boundary_conditions='neumann', **kwargs):
+    """
+    Constructs the 1st-order derivative (Neumann) boundary conditions.
+    Explicitly forces the spatial coordinates to align with domain bounds.
+    """
+    dim = len(domain)
+    bc_dict = {}
+    if boundary_conditions is None:
+        return bc_dict
+
+    assert isinstance(boundary_conditions, str)
+    if boundary_conditions.lower() == 'neumann':
+        k = 1
+    elif boundary_conditions.lower() == 'dirichlet':
+        k = 0
+    else:
+        raise ValueError
+
+    def force_boundary_eval(x_input, d_idx, fixed_val, deriv_tuple):
+        x_exact = x_input.copy()
+        x_exact[:, d_idx] = fixed_val
+        return true_sol_with_derivatives(x_exact, **kwargs)[deriv_tuple]
+
+    for d in range(dim):
+        d_min, d_max = domain[d]
+        deriv_order = [0] * dim
+        deriv_order[d] = k
+        deriv_order = tuple(deriv_order)
+        # Bind loop variables by value using default arguments to prevent closure corruption
+        bc_dict[(f'{d}_min', k)] = (
+            lambda x, d_idx=d, val=d_min, order=deriv_order: force_boundary_eval(
+                x, d_idx=d_idx, fixed_val=val, deriv_tuple=order
+            )
+        )
+        bc_dict[(f'{d}_max', k)] = (
+            lambda x, d_idx=d, val=d_max, order=deriv_order: force_boundary_eval(
+                x, d_idx=d_idx, fixed_val=val, deriv_tuple=order
+            )
+        )
+
+    return bc_dict
 
 def run_pde_experiment(
         pde_name,
@@ -33,7 +74,7 @@ def run_pde_experiment(
     Handles arg parsing, data generation, training loops, and metrics.
     """
     parser = argparse.ArgumentParser(description=f"Run {dim}D {pde_name} PDE")
-    parser.add_argument("-nf", "--sample_size_frac", type=float, default=1., help='Data to Spline Ratio')
+    parser.add_argument("-n", "--sample_size", type=int, default=1000)
     parser.add_argument("-sf", "--sigma_frac", type=float, default=0.1, help="Noise to Signal Ratio")
     parser.add_argument("-a", "--alpha", type=float, default=.05)
     parser.add_argument("-q", "--quantile", type=str, default='0')
@@ -42,15 +83,14 @@ def run_pde_experiment(
     parser.add_argument("-d", "--debug", type=str, default='0')
     parser.add_argument("-w", "--weak_form", type=str, default='0')
 
-    # Dynamically inject PDE-specific arguments from the dictionary
     for p_name, p_dict in pde_params.items():
-        p_flag = p_dict.pop('flag')
-        parser.add_argument(f"-{p_name}", f"--{p_flag}", **p_dict)
-        p_dict['flag'] = p_flag
+        p_flag = p_dict['flag']
+        arg_kwargs = {k: v for k, v in p_dict.items() if k != 'flag'}
+        parser.add_argument(f"-{p_name}", f"--{p_flag}", **arg_kwargs)
 
     args = parser.parse_args()
 
-    nf = args.sample_size_frac
+    n = args.sample_size
     sigma_frac = args.sigma_frac
     alpha = args.alpha
     n_iter = args.iteration
@@ -69,12 +109,7 @@ def run_pde_experiment(
     # Calculate required knots and metadata specific to this PDE
     domain, pde_kwargs, action_kwargs, true_params, num_int_knots = setup_config_func(params)
 
-    if num_int_knots is not None:
-        n = int(num_int_knots * nf)
-    else:
-        n = int(3000 ** (dim / 2))  # Fallback if knots are strictly dynamically determined
-
-    print(f'Sample Size: {n}')
+    # print(f'Sample Size: {n}')
 
     # Grid Generation
     grid_size_1d = int(min(x_max_size ** (1 / dim), oversample * n))
@@ -85,8 +120,10 @@ def run_pde_experiment(
     y = next(iter(y_derivs.values()))
     sigma_scaled = np.std(y) * sigma_frac
 
-    bc_dict = boundary_conditions(**params, domain=domain)
+    # boundary_conditions(**params, domain=domain)
+    bc_dict = get_bc_dict(true_sol_with_derivatives, domain, boundary_conditions=boundary_conditions, **params)
     kwargs = action_kwargs if action else pde_kwargs
+    fname = f'Bayes{pde_name}' + str(args).replace('Namespace', ' ') + '.csv'
 
     def run_one(i):
         rng = np.random.default_rng(i)
@@ -102,9 +139,12 @@ def run_pde_experiment(
         index_test = rng.choice(range(len(x)), n)
         index_test = np.sort(index_test)
         x_test, y_test, e_test = x[index_test], y_noise[index_test], noise[index_test]
-        dataset = pd.DataFrame({'x': x_train[:,0], 'y': x_train[:, 1], 'z': y_train})
 
-        print(f"True Sigma: {sigma_scaled}")
+        if debug:
+            dataset = pd.DataFrame({'x': x_train[:, 0], 'y': x_train[:, 1], 'z': y_train})
+            dataset.to_csv(f'/Users/cheungjustin/PDE/EWA/dataset/{pde_name}.csv')
+
+        # print(f"True Sigma: {sigma_scaled}")
         model = EWABSplinePDE(dim=dim, variables=variables, domain=domain, boundary_conditions=bc_dict,
                               alpha=alpha, quantile_based=quantile_based, num_int_knots=num_int_knots,
                               total_grid_size=10000, norm_omega=False,
@@ -142,7 +182,6 @@ def run_pde_experiment(
             # model.plot_fit_stats()
             # model.galerkin_force_diagnostics()
             # model.galerkin_penalty_diagnostics()
-            model.plot_basis_functions()
 
             # Plot True Solution (If 2D)
             if dim == 2:
@@ -160,8 +199,11 @@ def run_pde_experiment(
             # Plot Fitted
             model.plot_fit(x_test=x_test, y_test=y_test)
             plt.show()
-            print(res_series)
+            # print(res_series)
 
+            model.plot_lambda_weight()
+            model.plot_eigenvalues()
+            model.plot_basis_functions()
             model.plot_derivatives(deriv_orders_list=[(0, 0), (1, 0), (0, 1), (2, 0), (1,1), (0, 2)],
                                    true_deriv_func=true_sol_with_derivatives,
                                    true_deriv_kwargs=params)
@@ -170,8 +212,6 @@ def run_pde_experiment(
     t0 = time.time()
     res_list = parallel(run_one, range(n_iter), disable_par=True)
     res_df = pd.concat(res_list, names=['iter'], axis=1).T
-
-    fname = f'Bayes{pde_name}' + str(args).replace('Namespace', ' ') + '.csv'
 
     if save:
         # Falls back to local output directory if absolute path is missing

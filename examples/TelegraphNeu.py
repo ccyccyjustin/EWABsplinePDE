@@ -9,6 +9,7 @@ X_MAX_SIZE = 1_000_000
 DIM = 2
 OVERSAMPLE = 100
 VARIABLES = ['x', 'y']
+boundary_conditions = 'neumann'
 
 # --- Experiment Parameters ---
 PDE_PARAMS = {
@@ -116,31 +117,9 @@ def setup_config(params):
     ACTION_KWARGS['force'] = force_known
 
     true_params = {'p_c': params['p_c']}
-    num_int_knots = 3000
+    num_int_knots = 1000
     return domain, PDE_KWARGS, ACTION_KWARGS, true_params, num_int_knots
 
-
-def get_neumann_bc_dict(domain, **kwargs):
-    """
-    Constructs the 1st-order derivative (Neumann) boundary conditions.
-    Explicitly forces the spatial coordinates to align with domain bounds.
-    """
-    x_min, x_max = domain[0]
-    y_min, y_max = domain[1]
-
-    def force_boundary_eval(x_input, dim, fixed_val, deriv_order):
-        x_exact = x_input.copy()
-        x_exact[:, dim] = fixed_val
-        return true_sol_with_derivatives(x_exact, **kwargs)[deriv_order]
-
-    bc_dict = {
-        ('0_min', 1): lambda x: force_boundary_eval(x, dim=0, fixed_val=x_min, deriv_order=(1, 0)),
-        ('0_max', 1): lambda x: force_boundary_eval(x, dim=0, fixed_val=x_max, deriv_order=(1, 0)),
-        ('1_min', 1): lambda x: force_boundary_eval(x, dim=1, fixed_val=y_min, deriv_order=(0, 1)),
-        ('1_max', 1): lambda x: force_boundary_eval(x, dim=1, fixed_val=y_max, deriv_order=(0, 1))
-    }
-    # bc_dict = {}
-    return bc_dict
 
 
 if __name__ == '__main__':
@@ -150,7 +129,7 @@ if __name__ == '__main__':
         variables=VARIABLES,
         pde_params=PDE_PARAMS,
         true_sol_with_derivatives=true_sol_with_derivatives,
-        boundary_conditions=get_neumann_bc_dict,
+        boundary_conditions=boundary_conditions,
         setup_config_func=setup_config,
         x_max_size=X_MAX_SIZE,
         oversample=OVERSAMPLE,
