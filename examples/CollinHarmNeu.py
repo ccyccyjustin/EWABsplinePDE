@@ -88,17 +88,16 @@ def setup_config_func(params):
   # Model is configured to learn c ('y,y') and d ('x')
   # Locking 'x,x' to 1.0; true values are c = 1.0, d = 0.0
   PDE_KWARGS = {
-      'deriv_coef': {'x,x': 1.0, 'y,y': 1.0, 'x': 0.0},
+      'deriv_coef': {'x,x': 1.0, 'y,y': 1.5, 'x': 0.5},
       'trainable': ['y,y', 'x'],
       'force': force_known,
   }
 
-  ACTION_KWARGS = {}
   true_params = {'diff_y': 1.0, 'vel_x': 0.0}
 
-  num_int_knots = 500 #required_knots_per_dim**DIM
+  num_int_knots = 1000 #required_knots_per_dim**DIM
 
-  return DOMAIN, PDE_KWARGS, ACTION_KWARGS, true_params, num_int_knots
+  return DOMAIN, PDE_KWARGS, true_params, num_int_knots
 
 
 if __name__ == '__main__':

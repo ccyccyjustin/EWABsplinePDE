@@ -84,11 +84,10 @@ def setup_config_func(params):
       'force': force_known,
   }
 
-  ACTION_KWARGS = {}
   true_params = {'signal_present': False}
 
   num_int_knots = 1000
-  return DOMAIN, PDE_KWARGS, ACTION_KWARGS, true_params, num_int_knots
+  return DOMAIN, PDE_KWARGS, true_params, num_int_knots
 
 
 if __name__ == '__main__':

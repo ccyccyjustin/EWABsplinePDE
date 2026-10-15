@@ -18,22 +18,10 @@ def setup_config_func(params):
     PDE_KWARGS['deriv_coef'] = {'x,x': 1., 'y,y': 1., '': 1.}
     PDE_KWARGS['trainable'] = ['']
 
-    ACTION_KWARGS = {}
-    action_coef = {
-        ('x', 'x'): -1.,  # u_x * u_x
-        ('y', 'y'): -1.,  # u_y * u_y
-        ('', ''): 1.  # -(k ** 2)  # u * u
-    }
-    ACTION_KWARGS['action_coef'] = action_coef
-    ACTION_KWARGS['trainable'] = [('', '')]
-
     k_sqr = (params['p_m'] ** 2 + params['p_n'] ** 2) * (np.pi ** 2)
-    k = np.sqrt(k_sqr)
     true_params = {'k_sqr': k_sqr}
-
-    #required_knots_per_dim = int((k / np.pi) * 3)
-    num_int_knots = 2000# required_knots_per_dim ** 2
-    return DOMAIN, PDE_KWARGS, ACTION_KWARGS, true_params, num_int_knots
+    num_int_knots = 2000
+    return DOMAIN, PDE_KWARGS, true_params, num_int_knots
 
 #TODO: Weak only works when true grad=0 on boundaries
 PDE_PARAMS = {'p_m':

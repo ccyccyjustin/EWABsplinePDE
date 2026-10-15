@@ -98,7 +98,7 @@ def run_pde_experiment(
     save = to_bool(args.save)
     debug = to_bool(args.debug)
     quantile_based = to_bool(args.quantile)
-    action = to_bool(args.weak_form)
+    weak_form = to_bool(args.weak_form)
 
     if debug:
         n_iter = 1
@@ -107,7 +107,7 @@ def run_pde_experiment(
     params = {p_name: getattr(args, p_dict['flag']) for p_name, p_dict in pde_params.items()}
 
     # Calculate required knots and metadata specific to this PDE
-    domain, pde_kwargs, action_kwargs, true_params, num_int_knots = setup_config_func(params)
+    domain, pde_kwargs, true_params, num_int_knots = setup_config_func(params)
 
     # print(f'Sample Size: {n}')
 
@@ -122,7 +122,6 @@ def run_pde_experiment(
 
     # boundary_conditions(**params, domain=domain)
     bc_dict = get_bc_dict(true_sol_with_derivatives, domain, boundary_conditions=boundary_conditions, **params)
-    kwargs = action_kwargs if action else pde_kwargs
     fname = f'Bayes{pde_name}' + str(args).replace('Namespace', ' ') + '.csv'
 
     def run_one(i):
@@ -147,9 +146,8 @@ def run_pde_experiment(
         # print(f"True Sigma: {sigma_scaled}")
         model = EWABSplinePDE(dim=dim, variables=variables, domain=domain, boundary_conditions=bc_dict,
                               alpha=alpha, quantile_based=quantile_based, num_int_knots=num_int_knots,
-                              total_grid_size=10000, norm_omega=False,
-                              sigma=None, #sigma_scaled, #TODO!!!!!
-                              **kwargs)
+                              total_grid_size=10000, weak_form=weak_form,
+                              **pde_kwargs)
         model.fit(x_train, y_train)
 
         def get_metrics(x_ev, y_ev, e_ev):
@@ -225,7 +223,7 @@ def run_pde_experiment(
 
     t1 = time.time()
     print(f"Elapsed Time: {t1 - t0:.2f}s")
-    mode_str = "DUAL" if action else "PDE"
+    mode_str = "VARIATIONAL" if weak_form else "PDE"
     print(f'PDE Mode: {mode_str} | Meta Info: {true_params}')
 
     return res_df

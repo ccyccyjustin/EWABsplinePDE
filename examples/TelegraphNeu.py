@@ -105,20 +105,9 @@ def setup_config(params):
         'force': force_known
     }
 
-    # Action coefficients are negated PDE coefficients
-    ACTION_KWARGS = {}
-    action_coef = {
-        ('x', 'x'): wave_speed_sq,
-        ('y', 'y'): -1,
-        ('y',): -gamma_coeff
-    }
-    ACTION_KWARGS['action_coef'] = action_coef
-    ACTION_KWARGS['trainable'] = [('x', 'x')]
-    ACTION_KWARGS['force'] = force_known
-
     true_params = {'p_c': params['p_c']}
     num_int_knots = 1000
-    return domain, PDE_KWARGS, ACTION_KWARGS, true_params, num_int_knots
+    return domain, PDE_KWARGS, true_params, num_int_knots
 
 
 

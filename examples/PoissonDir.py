@@ -81,24 +81,9 @@ def setup_config(params):
         'force': force_known
     }
 
-    # TODO: ALWAYS PASS NEGATIVE!
-    ACTION_KWARGS = {}
-    action_coef = {
-        ('x', 'x'): -1,  # u_x * u_x
-        ('y', 'y'): -3,  # u_y * u_y
-    }
-    ACTION_KWARGS['action_coef'] = action_coef
-    ACTION_KWARGS['trainable'] = [('y', 'y')] #, ('y', 'y')
-    ACTION_KWARGS['force'] = force_known
-
     true_params = {'p_a': params['p_a']}
-
-    k_sqr = (params['p_m'] ** 2 + params['p_n'] ** 2) * (np.pi ** 2)
-    k = np.sqrt(k_sqr)
-
-    required_knots_per_dim = int((k / np.pi) * 3)
-    num_int_knots = required_knots_per_dim ** DIM
-    return domain, PDE_KWARGS, ACTION_KWARGS, true_params, num_int_knots
+    num_int_knots = 500
+    return domain, PDE_KWARGS, true_params, num_int_knots
 
 if __name__ == '__main__':
     # Dispatches the physics definitions to the general testing suite

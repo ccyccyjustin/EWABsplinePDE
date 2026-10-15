@@ -39,7 +39,7 @@ PDE_PARAMS = {
         'type': float,
         'default': 2.0 / 3.0,
     },  # 2/3 corner singularity
-    'p_scale': {'flag': 'scale', 'type': float, 'default': 1.0},
+    'p_scale': {'flag': 'scale', 'type': float, 'default': 1.5},
 }
 
 
@@ -102,18 +102,17 @@ def setup_config_func(params):
   # Strong Form: u_xx + c * u_yy = 0
   # Locking 'x,x' to 1.0; target for 'y,y' is c = 1.0
   PDE_KWARGS = {
-      'deriv_coef': {'x,x': 1.0, 'y,y': 1.0},
-      'trainable': ['y,y'],
+      'deriv_coef': {'': 0.0, 'x,x': 1.0, 'y,y': 1.0},
+      'trainable': ['', 'y,y'],
       'force': force_known,
   }
 
-  ACTION_KWARGS = {}
   true_params = {'diff_y': 1.0}
 
   # Allocate higher resolution near domain bounds
-  num_int_knots = 2000 #45**DIM
+  num_int_knots = 1000 #45**DIM
 
-  return DOMAIN, PDE_KWARGS, ACTION_KWARGS, true_params, num_int_knots
+  return DOMAIN, PDE_KWARGS, true_params, num_int_knots
 
 
 if __name__ == '__main__':

@@ -119,8 +119,6 @@ def setup_config(params):
       'force': force_known,
   }
 
-  ACTION_KWARGS = {}
-
   # Ensure knot density adequately resolves the highest spatio-temporal frequency
   max_freq = max(
       params['p_m2'] * np.pi / params['p_L'],
@@ -129,7 +127,7 @@ def setup_config(params):
   required_knots_per_dim = int(max(30, (max_freq / np.pi) * 8))
   num_int_knots = required_knots_per_dim**DIM
 
-  return domain, PDE_KWARGS, ACTION_KWARGS, true_params, num_int_knots
+  return domain, PDE_KWARGS, true_params, num_int_knots
 
 
 if __name__ == '__main__':

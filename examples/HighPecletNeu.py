@@ -123,13 +123,8 @@ def setup_config(params):
       'force': force_known,
   }
 
-  ACTION_KWARGS = {}
-
-  # Mesh resolution adapted to Péclet number to capture boundary layer thickness O(alpha/v)
-  peclet = abs(v / alpha)
-  required_knots_per_dim = int(min(120, max(30, peclet * 0.7)))
-  num_int_knots = 1000 #required_knots_per_dim**DIM
-  return domain, PDE_KWARGS, ACTION_KWARGS, true_params, num_int_knots
+  num_int_knots = 1000
+  return domain, PDE_KWARGS, true_params, num_int_knots
 
 
 if __name__ == '__main__':

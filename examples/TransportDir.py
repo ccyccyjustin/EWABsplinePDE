@@ -108,13 +108,12 @@ def setup_config_func(params):
       'force': force_known,
   }
 
-  ACTION_KWARGS = {}
   true_params = {'vel_y': params['p_cy'], 'diff_xx': 0.0}
 
   required_knots_per_dim = int(max(30, params['p_m2'] * 15))
   num_int_knots = required_knots_per_dim**DIM
 
-  return DOMAIN, PDE_KWARGS, ACTION_KWARGS, true_params, num_int_knots
+  return DOMAIN, PDE_KWARGS, true_params, num_int_knots
 
 
 if __name__ == '__main__':

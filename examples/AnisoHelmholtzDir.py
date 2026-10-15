@@ -23,13 +23,11 @@ def setup_config_func(params):
     PDE_KWARGS['trainable'] = ['', 'y,y']
     PDE_KWARGS['bias_corrected'] = False
 
-    ACTION_KWARGS = {}
-
     max_freq = max(params['p_m'], params['p_n'], 3.0)
     required_knots_per_dim = int(max_freq * 5)
     num_int_knots = required_knots_per_dim ** 2
 
-    return DOMAIN, PDE_KWARGS, ACTION_KWARGS, true_params, num_int_knots
+    return DOMAIN, PDE_KWARGS, true_params, num_int_knots
 
 
 PDE_PARAMS = {
