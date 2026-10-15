@@ -144,7 +144,7 @@ def project_to_bspline(y, x, s=0, k=3):
     return y_fit
 
 
-def compute_spline_integral_gl(spl, u, v):
+def compute_spline_integral_gl(spl, u, v, sparse=False):
     """
     Optimized vector-constructed calculation of the 1D spline derivative integral.
     Handles non-uniform knot sequences exactly using vectorized Gauss-Legendre quadrature.
@@ -164,6 +164,7 @@ def compute_spline_integral_gl(spl, u, v):
     # 1. Setup full padded knot vector
     deg = spl.k
     all_knots = spl.t
+    n_splines = spl.c.shape[0]
     internal_knots = all_knots[deg:-deg]
 
     x_L = internal_knots[:-1]
@@ -192,63 +193,28 @@ def compute_spline_integral_gl(spl, u, v):
     # vals_v = np.nan_to_num(vals_v)
 
     # 6. Contract across the flattened quadrature dimensions
-    omega = np.einsum('k,ki,kj->ij', w_flat, vals_u, vals_v)
-    return omega
-
-
-def compute_sparse_spline_integral_gl(spl, u: int = 0, v: int = 0) -> sp.csr_matrix:
-    """
-    Computes the 1D L2 inner product matrix of B-spline derivatives:
-        K_{ij} = \int D^u B_i(x) D^v B_j(x) dx
-    using vectorized Gauss-Legendre quadrature. Returns a sparse CSR matrix.
-    """
-    deg = spl.k
-    all_knots = spl.t
-    n_splines = spl.c.shape[0]
-
-    assert u <= deg and v <= deg, "Deg not sufficient for PDE!"
-
-    # 3. Extract non-empty knot intervals
-    internal_knots = all_knots[deg:-deg]
-    x_L = internal_knots[:-1]
-    x_R = internal_knots[1:]
-
-    assert len(internal_knots) > 2
-
-    # 4. Gauss-Legendre quadrature setup
-    # Exact for polynomials of degree <= (deg - u) + (deg - v) <= 2 * deg
-    n_gl = max(1, deg + 1)
-    xi, wi = np.polynomial.legendre.leggauss(n_gl)
-
-    mid = (x_L + x_R) / 2.0
-    hw = (x_R - x_L) / 2.0
-
-    # Vectorized evaluation points and weights across all intervals
-    x_pts = (mid[:, None] + hw[:, None] * xi[None, :]).ravel()
-    w_pts = (hw[:, None] * wi[None, :]).ravel()
-
-    # 5. Evaluate B-spline basis derivatives
-    Bu = spl(x_pts, nu=u)
-    Bv = Bu if u == v else spl(x_pts, nu=v)
-
-    # 6. Quadrature summation via matrix multiplication: Bu.T @ diag(w) @ Bv
-    if sp.issparse(Bu):
-        W = sp.diags(w_pts, format='csr')
-        K = Bu.T @ W @ Bv
-        if not sp.issparse(K):
-            K = sp.csr_matrix(K)
+    if not sparse:
+        omega = np.einsum('k,ki,kj->ij', w_flat, vals_u, vals_v)
+        return omega
     else:
-        K_dense = Bu.T @ (w_pts[:, None] * Bv)
+        # 6. Quadrature summation via matrix multiplication: Bu.T @ diag(w) @ Bv
+        if sp.issparse(vals_u):
+            W = sp.diags(w_flat, format='csr')
+            K = vals_u.T @ W @ vals_v
+            if not sp.issparse(K):
+                K = sp.csr_matrix(K)
+        else:
+            K_dense = vals_u.T @ (w_flat[:, None] * vals_v)
 
-        # Enforce exact local support: B_i and B_j overlap only if |i - j| <= deg
-        idx_diff = np.abs(np.subtract.outer(np.arange(n_splines), np.arange(n_splines)))
-        K_dense[idx_diff > deg] = 0.0
-        K_dense[np.abs(K_dense) < 1e-15] = 0.0
+            # Enforce exact local support: B_i and B_j overlap only if |i - j| <= deg
+            idx_diff = np.abs(np.subtract.outer(np.arange(n_splines), np.arange(n_splines)))
+            K_dense[idx_diff > deg] = 0.0
+            K_dense[np.abs(K_dense) < 1e-15] = 0.0
 
-        if u == v:
-            K_dense = (K_dense + K_dense.T) / 2.0
+            if u == v:
+                K_dense = (K_dense + K_dense.T) / 2.0
 
-        K = sp.csr_matrix(K_dense)
+            K = sp.csr_matrix(K_dense)
 
-    K.eliminate_zeros()
-    return K
+        K.eliminate_zeros()
+        return K
