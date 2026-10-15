@@ -1,16 +1,28 @@
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
-from scipy.interpolate import splev, splrep, BSpline
-from scipy.linalg import lstsq
-import scipy.linalg as la
+import seaborn as sns
+from matplotlib.colors import Normalize
+from matplotlib.cm import ScalarMappable
+
 from joblib import Parallel, delayed
 from tqdm import tqdm
+
 from scipy.linalg import eigh
+import scipy.sparse.linalg as spla
+import scipy.sparse as sp
 from scipy.stats import norm, multivariate_normal
-import seaborn as sns
-from matplotlib.colors import Normalize, CenteredNorm
-from matplotlib.cm import ScalarMappable
-import pandas as pd
+from scipy.spatial import cKDTree
+from scipy.optimize import lsq_linear
+
+import time
+import inspect
+from functools import wraps
+import sys
+
+import logging
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+logger = logging.getLogger(__name__)
 
 CMAP = sns.diverging_palette(20, 220, as_cmap=True)
 
@@ -27,26 +39,6 @@ def parallel(func, iterable, n_jobs=-1, disable_par=False, **kwargs):
     return results
 
 
-def perturb_diag(A):
-    A2 = A.copy()
-    n_col = A.shape[1]
-    eps = np.sqrt(np.finfo(float).eps) * np.trace(A) / n_col
-    np.fill_diagonal(A2, A.diagonal() + eps)
-    return A2, eps
-
-
-def perturb_B_svd(B, eps):
-    # Decompose the original B
-    U, s, Vt = np.linalg.svd(B, full_matrices=False)
-
-    # Add epsilon to the squared singular values, then take the square root
-    s2 = np.sqrt(s ** 2 + eps)
-
-    # Reconstruct B2
-    B2 = (U * s2) @ Vt
-    return B2
-
-
 def orthogonalize_basis_fast(G_perturb, omega, k=None):
     """
     Lets LAPACK handle the GEVP using the precomputed G matrix.
@@ -60,27 +52,64 @@ def orthogonalize_basis_fast(G_perturb, omega, k=None):
     else:
         subset_by_index = None
 
-    # s_raw, V = eigh(omega, G_perturb, subset_by_index=subset_by_index)
-    #
-    # # 2. Sort eigenvalues and eigenvectors in descending order
-    # idx = np.argsort(s_raw)[::-1]
-    # s_raw = s_raw[idx]
-    # # s_raw = np.maximum(s_raw, 0)
-    # V = V[:, idx]
+    if sp.issparse(omega):
+        omega = omega.toarray()
+    if sp.issparse(G_perturb):
+        G_perturb = G_perturb.toarray()
 
-    omega_norm = np.trace(omega) / omega.shape[0]
-    G_norm = np.trace(G_perturb) / G_perturb.shape[0] # Makes V close to 1
-    s_raw, V = eigh(omega / omega_norm, G_perturb / G_norm, subset_by_index=subset_by_index)
+    s_raw, V = eigh(omega, G_perturb, subset_by_index=subset_by_index)
+    # sum_s = np.trace(np.linalg.solve(G_perturb, omega))
+    # print(f'Eigvals explained: {s_raw.sum() / sum_s}')
 
-    idx2 = np.argsort(s_raw)[::-1]
+    idx2 = np.argsort(s_raw)
     s_raw = s_raw[idx2]
-    # s_raw = np.maximum(s_raw, 0)
     V = V[:, idx2]
-    s_raw = s_raw * omega_norm / G_norm
-    V = V / np.sqrt(G_norm)
+    return s_raw, V
 
-    # 3. Construct the orthonormal basis U
-    return {'V': V, 's_raw': s_raw}
+
+def compute_smallest_eigenvectors(penalty_matrix, gram, k, sigma=-1e-4, tol=1e-9):
+    evals, evecs = spla.eigsh(
+        A=penalty_matrix,
+        k=k,
+        M=gram,
+        sigma=sigma,
+        which='LM',
+        tol=tol
+    )
+    return evals, evecs
+
+
+def compute_smallest_eigenvectors_cg(penalty_matrix, gram, k):
+    N = penalty_matrix.shape[0]
+
+    from scipy.sparse.linalg import spilu, LinearOperator, lobpcg
+    # 1. Provide an Incomplete LU / Cholesky Preconditioner
+    # An ILU with drop_tol=1e-3 computes in ~0.05s and cuts condition number by 1000x
+    ilu = spilu((penalty_matrix + 1.0 * gram), drop_tol=1e-3)
+    M_precond = LinearOperator((N, N), matvec=lambda x: ilu.solve(x))
+
+    # 2. Smooth Initialization (CRITICAL)
+    # Generate random vectors, but smooth them through the preconditioner once
+    rng = np.random.default_rng(42)
+    X_raw = rng.standard_normal((N, k))
+    X_smooth = ilu.solve(X_raw) # Filters out knot-scale noise instantly
+
+    # 3. Run LOBPCG with preconditioner and higher iteration ceiling
+    evals, evecs = lobpcg(
+        A=penalty_matrix,
+        X=X_smooth,
+        B=gram,
+        M=M_precond, # Preconditioner makes CG steps effective
+        largest=False,
+        tol=1e-4,
+        maxiter=400
+    )
+    # eigenfunctions = scipy.linalg.eigh(penalty_matrix, self.gram)
+    idx = np.argsort(evals)
+    evals = evals[idx]
+    evecs = evecs[:, idx]
+    return evals, evecs
+
 
 def gsj_est(y):
 
@@ -100,9 +129,6 @@ def gsj_est(y):
     res = np.convolve(y, c, mode='valid')
     sigma_sq = np.sum(res ** 2) / (n - 2)
     return np.sqrt(sigma_sq)
-
-
-from scipy.spatial import cKDTree
 
 
 def gsj_est_2d_scattered(X, y):
@@ -131,7 +157,7 @@ def gsj_est_2d_scattered(X, y):
     return np.sqrt(sigma_sq)
 
 
-def compute_sure(y, fhatps, shrinkage_matrix, sig2):
+def compute_sure(y, fhatps, df, sig2):
     """
     Vectorized computation of Stein's Unbiased Risk Estimate (SURE).
     """
@@ -141,14 +167,23 @@ def compute_sure(y, fhatps, shrinkage_matrix, sig2):
     # We compute col-wise: sum((y - fhat_j)^2)
     residuals = y[:, np.newaxis] - fhatps
     rss = np.sum(residuals ** 2, axis=0)
-
-    # 2. Effective Degrees of Freedom (df) for every lambda
-    # s is (p,), lam_vec is (n_lambda,)
-    # df_j = sum_k( 1 / (1 + s_k * lam_j) )
-    df = np.sum(shrinkage_matrix, axis=0)
-
-    # 3. SURE calculation
     return rss + 2.0 * sig2 * df
+
+
+def compute_sure_spectral(s, d, force_proj, y_fit, lam_vec, n, weight):
+    w_tilde = 0.0 if force_proj is None else force_proj
+    delta = (s * d) - w_tilde
+
+    rss_spectral = n * np.sum(((lam_vec[np.newaxis, :] * delta[:, np.newaxis]) * weight) ** 2, axis=0)
+
+    # Orthogonal complement: ||y_perp||^2 = ||y||^2 - n * ||d||^2
+    y_perp_sq = np.sum(y_fit ** 2) - n * np.sum(d ** 2)
+    rss_exact = rss_spectral + y_perp_sq
+
+    # Exact Trace (Effective Degrees of Freedom)
+    omega_matrix = (1.0 - lam_vec)[np.newaxis, :] * n * weight
+    trace_exact = np.sum(omega_matrix, axis=0)
+    return rss_exact, trace_exact
 
 
 def ewa_weights(sure, prior, gamma):
@@ -163,69 +198,79 @@ def ewa_weights(sure, prior, gamma):
     return w / np.sum(w)
 
 
-def fit_ewa_helper(U, y_fit, s, lam_vec, prior, gamma_c, sig2_est, force_proj=None):
+def fit_ewa_helper(y_fit, force_proj, U, V, s,
+                   lam_vec, prior,
+                   gamma_mult, sigma_est
+                ):
     """
     1. ridge shrinkage
     2. SURE
     3. weights & EWA
     Highly optimized for large N (rows of U).
-    fhat_ps = U @ ((1.0 / (1.0 + s[:, np.newaxis] * lam_vec[np.newaxis, :])) * (U.T @ y)[:, np.newaxis ])
-    fhat_ewa = fhat_ewa @ weight
     """
     # 1. Project y into the orthogonal space: U'y (Size: p)
     # 2. Compute Ridge Path (fhatps)
     # shrinkage_matrix is (p, n_lambda)
     assert (lam_vec.min() >= 0) and (lam_vec.max() <= 1)
-    Uty = U.T @ y_fit
-    shrinkage_matrix = 1.0 / (1.0 + (s[:, np.newaxis] - 1) * lam_vec[np.newaxis, :])
+    sig2 = sigma_est ** 2
+
+    n = len(y_fit)
+    d = U.T @ y_fit / n
+
+    # Compute alpha
+    denom = (1.0 - lam_vec)[np.newaxis, :] * n + lam_vec[np.newaxis, :] * s[:, np.newaxis]
+    shrinkage_matrix = 1.0 / denom
     assert shrinkage_matrix.min() > 0
+    assert np.all(s[:-1] <= s[1:])
 
     if force_proj is not None:
-        num = Uty[:, np.newaxis] + lam_vec[np.newaxis, :] * (force_proj - Uty)[:, np.newaxis]
+        num = (1.0 - lam_vec)[np.newaxis, :] * (n * d[:, np.newaxis]) + lam_vec[np.newaxis, :] * force_proj[:, np.newaxis]
     else:
-        num = (1 - lam_vec)[np.newaxis, :] * Uty[:, np.newaxis]
+        num = (1.0 - lam_vec)[np.newaxis, :] * (n * d[:, np.newaxis])
 
     alpha_hat = shrinkage_matrix * num
-    # fhatps is (n, n_lambda). Memory Warning: 10M x 100 is ~8GB
-    fhatps = U @ alpha_hat # y_pred
+
+    # Compute y_fit and df
+    omega_matrix = shrinkage_matrix * (1 - lam_vec) * n
 
     # 4. EWA weights and fitted values for each gamma_c
-    sure_est = compute_sure(y_fit, fhatps, shrinkage_matrix, sig2_est)
-    gamma = gamma_c * sig2_est
+    # compute_sure(y=y_fit, fhatps=fhatps, df=df, sig2=sig2)
+    rss_exact, trace_exact = compute_sure_spectral(s, d, force_proj, y_fit, lam_vec, n, shrinkage_matrix)
+    sure_est = rss_exact + 2.0 * sig2 * trace_exact
+    gamma = gamma_mult * sig2
     weights = ewa_weights(sure_est, prior, gamma)
 
-    shrink_weight = (shrinkage_matrix @ weights.T).flatten()
-    #A = (U * shrink_weight) @ U.T
-    trace_hat = np.sum(shrink_weight)
-    # fhat_ewa = (U * shrink_weight) @ Uty # A @ y_fit
-    # theta_hat = Uty * shrink_weight
-    fhat_ewa = fhatps @ weights
     alpha_ewa = alpha_hat @ weights
+    beta_ewa = V @ alpha_ewa
+    fhat_ewa = U @ alpha_ewa
 
-    c_diag = shrinkage_matrix @ (lam_vec * weights)
-    M_diag = shrink_weight - c_diag
+    shrink_weight = (omega_matrix @ weights.T).flatten()
+    trace_hat = np.sum(shrink_weight)
 
     return {
-        "fhatps": fhatps,
         "lam_used": lam_vec,
         "sure_est": sure_est,
         "weights": weights,
         "fhat_ewa": fhat_ewa, # A @ Y_fit
-        'theta_hat': alpha_ewa,
+        'alpha_hat': alpha_ewa,
         'trace_hat': trace_hat,
         'shrink_weight': shrink_weight,
-        'Uty': Uty,
-        'M_diag_alpha': M_diag,
+        'beta': beta_ewa
     }
 
-def fit_ewa(y, ftrue, U, V, s, lam, prior, # B_s, a, b, int_knots deg=3, deriv_order=2
-            sig_eps_est, gamma_mult=8, force_proj=None):
+def fit_ewa(y, ftrue, force_proj,
+            U, V, s,
+            lam_vec, prior,
+            sigma_est, gamma_mult=8):
     """
     Implementation of the EWA spline fitting logic.
     """
 
     # 2. Precompute projections in orthogonal space
-    fit_res = fit_ewa_helper(U, y, s, lam, prior, gamma_mult, sig2_est=sig_eps_est ** 2, force_proj=force_proj)
+    fit_res = fit_ewa_helper(y, force_proj,
+                             U, V, s,
+                             lam_vec, prior,
+                             gamma_mult, sigma_est)
 
     # Calculate MSE if ftrue is provided (matching R's placeholder logic)
     mse_est = {}
@@ -234,16 +279,15 @@ def fit_ewa(y, ftrue, U, V, s, lam, prior, # B_s, a, b, int_knots deg=3, deriv_o
 
     # Find best lambda per gamma_mult
     best_idx = np.argmax(fit_res['weights'])
-    lam_best = lam[best_idx]
+    lam_best = lam_vec[best_idx]
 
-    beta = V @ fit_res['theta_hat']
+    # beta = V @ fit_res['theta_hat']
     rss = np.sum((fhat_ewa - y) ** 2)
     sigma_est = np.sqrt(rss / (len(y) - fit_res['trace_hat']))
 
     return {
-        "mse_est": mse_est, # OK!
-        "lam_best": lam_best,  # OK!
-        "beta": beta,
+        "mse_est": mse_est,
+        "lam_best": lam_best,
         'sigma_est': sigma_est,
         **fit_res
     }
@@ -476,3 +520,98 @@ def format_latex_name(op_key, axis_names = ['x', 'y', 'z', 'w']):
             terms.append(f"u_{{{subscript}}}")
 
     return "$" + " ".join(terms) + "$"
+
+
+def estimate_aniso(X, y, n_neighbor=None, max_iter=100):
+    """
+    Estimates the expected values of beta_k^2 and s^2 under the local
+    nearest-neighbor regression model.
+
+    Time complexity:
+      - Nearest Neighbors: O(N * log(N))
+      - Data Preparation: O(N * d)
+      - Pooled Regression: O(N * d) per iteration
+    """
+    assert (X >= 0).all() and (X <= 1).all()
+    N, d = X.shape
+
+    if n_neighbor is None:
+        n_neighbor = int(max(min(30, N / 10 ** d), 3))
+
+    # 1. Find nearest neighbors
+    # We query n_neighbor + 1 because a point is its own nearest neighbor (dist=0)
+    tree = cKDTree(X)
+    _, indices = tree.query(X, k=n_neighbor + 1)
+    neighbor_indices = indices[:, 1:]
+
+    # 2. Build regression differences in strictly O(N*d) using C-level broadcasting
+    # X[:, None, :] reshapes to (N, 1, d), allowing seamless subtraction against (N, n_neighbor, d)
+    dx2 = (X[:, None, :] - X[neighbor_indices]) ** 2
+    dy2 = (y[:, None] - y[neighbor_indices]) ** 2
+
+    # Flatten arrays to construct the global design matrix
+    dx2_flat = dx2.reshape(-1, d)
+    dy2_flat = dy2.ravel()
+
+    # 3. Formulate the linear system A * theta = b
+    num_equations = dx2_flat.shape[0]
+    A = np.empty((num_equations, d + 1))
+    A[:, 0] = 1.0
+    A[:, 1:] = dx2_flat
+
+    result = lsq_linear(
+        A,
+        dy2_flat,
+        bounds=(0, np.inf),
+        method='trf',
+        lsq_solver='lsmr',
+        max_iter=max_iter
+    )
+
+    theta = result.x
+    grad2 = theta[1:]
+
+    # 1. Expectation of intercept is 2 * s^2
+    # 2. Variance of residual is 8 * s^4 + 8 s^2 * E(Squared 1d-Distance in neighborhood) ||grad||^2
+    s2_intercept = theta[0] / 2
+
+    rss = np.sum((dy2_flat - A @ theta) ** 2)
+    df = N * n_neighbor - (d + 1)
+    mse = rss / df
+
+    s2_mse = np.sqrt(mse / 8)
+    s2 = max(s2_intercept, s2_mse)
+    # s2 = s2_intercept
+    y_smooth = np.mean(y[neighbor_indices], axis=1)
+    return s2, grad2, y_smooth
+
+def time_method(func):
+    """The actual timer wrapper for a single function."""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        start = time.perf_counter()
+        result = func(*args, **kwargs)
+        end = time.perf_counter()
+        if end - start > 0.1:
+        # func.__qualname__ will print 'ClassName.method_name'
+            logger.info(f"[{func.__qualname__}] took {end - start:.6f} seconds")
+        return result
+    return wrapper
+
+def time_all_methods(cls):
+    """Class decorator to apply the timer to all methods."""
+    # vars(cls) ensures we only wrap methods explicitly defined in THIS class,
+    # preventing us from accidentally wrapping inherited methods from 'object'
+    for attr_name, attr_value in vars(cls).items():
+        if inspect.isfunction(attr_value):
+            setattr(cls, attr_name, time_method(attr_value))
+    return cls
+
+# --- Put this at the BOTTOM of your file ---
+current_module = sys.modules[__name__]
+
+# Find all functions defined in this file and wrap them
+for name, obj in inspect.getmembers(current_module, inspect.isfunction):
+    # Only wrap functions actually defined in this module (not imported ones)
+    if obj.__module__ == __name__ and name != 'time_it':
+        setattr(current_module, name, time_method(obj))
