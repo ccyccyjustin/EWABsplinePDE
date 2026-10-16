@@ -144,24 +144,13 @@ def project_to_bspline(y, x, s=0, k=3):
     return y_fit
 
 
-def compute_spline_integral_gl(spl, u, v, sparse=False):
+def compute_spline_integral_gl(spl, u, v, sparse=False, weight_func=None):
     """
-    Optimized vector-constructed calculation of the 1D spline derivative integral.
-    Handles non-uniform knot sequences exactly using vectorized Gauss-Legendre quadrature.
-
-    Parameters:
-    -----------
-    all_knots : array-like
-        The complete knot vector (including padded boundary knots).
-    u, v : int
-        Derivative orders.
-    deg : int
-        Spline polynomial degree.
-    x_eval : array-like, optional
-        Custom evaluation points or interval boundaries. If None, integrates over
-        the entire internal knot domain.
+    Optimized vector-constructed calculation of the 1D spline derivative integral:
+        K_{ij} = \int w(x) D^u B_i(x) D^v B_j(x) dx
+    Handles non-uniform knot sequences and optional spatial weight functions w(x)
+    using vectorized Gauss-Legendre quadrature.
     """
-    # 1. Setup full padded knot vector
     deg = spl.k
     all_knots = spl.t
     n_splines = spl.c.shape[0]
@@ -170,34 +159,32 @@ def compute_spline_integral_gl(spl, u, v, sparse=False):
     x_L = internal_knots[:-1]
     x_R = internal_knots[1:]
 
-    # 3. Generate baseline Gauss-Legendre quadrature points on [-1, 1]
-    n_quad = max(1, deg + 1)
+    # Increase quadrature points when integrating a non-constant weight function w(x)
+    n_quad = max(1, deg + 1) if weight_func is None else max(4, 2 * deg + 2)
     quad_x, quad_w = np.polynomial.legendre.leggauss(n_quad)
 
-    # 4. Vectorized scaling transformation to local non-uniform intervals
     widths = x_R - x_L
     midpoints = x_R + x_L
 
     x_pts = 0.5 * widths[:, None] * quad_x[None, :] + 0.5 * midpoints[:, None]
     w_pts = 0.5 * widths[:, None] * quad_w[None, :]
 
-    # Flatten arrays to perform a single unified evaluation pass
     x_flat = x_pts.ravel()
     w_flat = w_pts.ravel()
 
+    # Apply 1D spatial coefficient weight function if provided (4.2)
+    if weight_func is not None:
+        w_flat = w_flat * np.asarray(weight_func(x_flat), dtype=float).ravel()
+
     vals_u = spl(x_flat, nu=u)
-    vals_v = spl(x_flat, nu=v)
+    vals_v = vals_u if u == v else spl(x_flat, nu=v)
 
-    # Clean up any NaN limits produced precisely at the right domain boundary 'b'
-    # vals_u = np.nan_to_num(vals_u)
-    # vals_v = np.nan_to_num(vals_v)
-
-    # 6. Contract across the flattened quadrature dimensions
     if not sparse:
-        omega = np.einsum('k,ki,kj->ij', w_flat, vals_u, vals_v)
-        return omega
+        if sp.issparse(vals_u):
+            vals_u = vals_u.toarray()
+            vals_v = vals_u if u == v else vals_v.toarray()
+        K = vals_u.T @ (w_flat[:, None] * vals_v)
     else:
-        # 6. Quadrature summation via matrix multiplication: Bu.T @ diag(w) @ Bv
         if sp.issparse(vals_u):
             W = sp.diags(w_flat, format='csr')
             K = vals_u.T @ W @ vals_v
@@ -210,11 +197,6 @@ def compute_spline_integral_gl(spl, u, v, sparse=False):
             idx_diff = np.abs(np.subtract.outer(np.arange(n_splines), np.arange(n_splines)))
             K_dense[idx_diff > deg] = 0.0
             K_dense[np.abs(K_dense) < 1e-15] = 0.0
-
-            if u == v:
-                K_dense = (K_dense + K_dense.T) / 2.0
-
             K = sp.csr_matrix(K_dense)
-
         K.eliminate_zeros()
-        return K
+    return K
