@@ -28,36 +28,35 @@ CMAP = sns.diverging_palette(20, 220, as_cmap=True)
 
 
 def parallel(func, iterable, n_jobs=-1, disable_par=False, **kwargs):
+    def _worker_task(func, *args, **kwargs):
+        """Executes inside each worker process to silence logs at the source."""
+        logging.disable(logging.INFO)
+        return func(*args, **kwargs)
+
     if disable_par:
         results = {i: func(i, **kwargs) for i in tqdm(iterable)}
         return results
 
     results = Parallel(n_jobs=n_jobs)(
-        delayed(func)(i, **kwargs) for i in tqdm(iterable)
+        delayed(_worker_task)(func, i, **kwargs) for i in tqdm(iterable)
     )
     results = {k: v for k, v in zip(iterable, results)}
     return results
 
 
-def orthogonalize_basis_fast(G_perturb, omega, k=None):
+def orthogonalize_basis_fast(G_perturb, omega):
     """
     Lets LAPACK handle the GEVP using the precomputed G matrix.
     This entirely avoids Python-level dense matrix multiplication overhead.
     """
 
     # 1. Solve GEVP directly (LAPACK's dsygvd handles Cholesky and symmetry in C/Fortran)
-    if k is not None:
-        N = G_perturb.shape[0]
-        subset_by_index = [N - k, N - 1]
-    else:
-        subset_by_index = None
-
     if sp.issparse(omega):
         omega = omega.toarray()
     if sp.issparse(G_perturb):
         G_perturb = G_perturb.toarray()
 
-    s_raw, V = eigh(omega, G_perturb, subset_by_index=subset_by_index)
+    s_raw, V = eigh(omega, G_perturb)
     # sum_s = np.trace(np.linalg.solve(G_perturb, omega))
     # print(f'Eigvals explained: {s_raw.sum() / sum_s}')
 
@@ -186,13 +185,13 @@ def compute_sure_spectral(s, d, force_proj, y_fit, lam_vec, n, weight):
     return rss_exact, trace_exact
 
 
-def ewa_weights(sure, prior, gamma):
+def ewa_weights(sure, prior=1.0, gamma=8.0):
     """
-    Log-sum-exp stabilized EWA weights.
+    Log-sum-exp stabilized EWA weights respecting the input prior distribution.
     """
-    # Use log space to prevent underflow/overflow
-    prior=1
-    log_w = -sure / gamma + np.log(prior)
+    assert gamma >= 1e-10, "EWA gamma too small"
+    log_prior = np.log(np.maximum(prior, 1e-300))
+    log_w = -sure / gamma + log_prior
     log_w -= np.max(log_w)  # Stabilization
     w = np.exp(log_w)
     return w / np.sum(w)
@@ -248,6 +247,7 @@ def fit_ewa_helper(y_fit, force_proj, U, V, s,
     trace_hat = np.sum(shrink_weight)
 
     return {
+        'gamma': gamma,
         "lam_used": lam_vec,
         "sure_est": sure_est,
         "weights": weights,
@@ -255,7 +255,9 @@ def fit_ewa_helper(y_fit, force_proj, U, V, s,
         'alpha_hat': alpha_ewa,
         'trace_hat': trace_hat,
         'shrink_weight': shrink_weight,
-        'beta': beta_ewa
+        'beta': beta_ewa,
+        'omega_matrix': omega_matrix,
+        'shrinkage_matrix': shrinkage_matrix
     }
 
 def fit_ewa(y, ftrue, force_proj,
@@ -306,7 +308,19 @@ def canberra_similarity(x, y):
 
     return 1.0 - np.mean(terms)
 
-def mvn_pairplot(mu, sigma, title='MVN Density Pairplot',
+
+def gaussian_crps(y_true: np.ndarray, mu: np.ndarray, sigma: np.ndarray) -> float:
+    """
+    Computes the analytical Continuous Ranked Probability Score (CRPS)
+    for Gaussian predictive distributions N(mu, sigma^2).
+    """
+    sigma_safe = np.maximum(sigma, 1e-12)
+    z = (y_true - mu) / sigma_safe
+    crps = sigma_safe * (z * (2.0 * norm.cdf(z) - 1.0) + 2.0 * norm.pdf(z) - 1.0 / np.sqrt(np.pi))
+    return float(np.mean(crps))
+
+
+def mvn_pairplot(mu, sigma, true_vals=None, title='MVN Density Pairplot',
                  labels=None, num_grid_points=100, one_figsize=2.2, **kwargs):
     """
     Generates a lower-triangular corner pair plot displaying the EXACT
@@ -327,6 +341,9 @@ def mvn_pairplot(mu, sigma, title='MVN Density Pairplot',
     mu = np.asarray(mu)
     sigma = np.asarray(sigma)
     dim = len(mu)
+    if true_vals is not None:
+        assert len(true_vals) == dim
+        assert np.isfinite(true_vals).all()
 
     if sigma.shape != (dim, dim):
         raise ValueError("Covariance matrix shape must match mean vector length.")
@@ -339,6 +356,10 @@ def mvn_pairplot(mu, sigma, title='MVN Density Pairplot',
     stdevs = np.sqrt(np.diagonal(sigma))
     mins = mu - 3.5 * stdevs
     maxs = mu + 3.5 * stdevs
+    if true_vals is not None:
+        true_vals = np.asarray(true_vals, dtype=float).ravel()
+        mins = np.minimum(mins, true_vals - 1.5 * stdevs)
+        maxs = np.maximum(maxs, true_vals + 1.5 * stdevs)
 
     # 2. Set up the plotting grid matrix
     fig, axes = plt.subplots(dim, dim, figsize=(one_figsize * dim, one_figsize * dim), squeeze=False)
@@ -355,13 +376,13 @@ def mvn_pairplot(mu, sigma, title='MVN Density Pairplot',
             # --- Case B: Diagonal (Exact Univariate Marginal PDF) ---
             if i == j:
                 x_eval = np.linspace(mins[i], maxs[i], num_grid_points * 2)
-                # Exact analytical 1D Gaussian density formula
                 pdf_eval = norm.pdf(x_eval, loc=mu[i], scale=stdevs[i])
-
                 ax.plot(x_eval, pdf_eval, color='midnightblue', linewidth=2)
                 ax.fill_between(x_eval, pdf_eval, color='midnightblue', alpha=0.3)
+                ax.axvline(mu[i], color='darkorange', ls='--', lw=1.5, label='Estimate')
+                if true_vals is not None:
+                    ax.axvline(true_vals[i], color='crimson', ls='-', lw=1.8, label='True $\\theta^*$')
 
-                # Format diagonal axes (hide Y-axis as it's just raw density magnitude)
                 ax.set_xlim(mins[i], maxs[i])
                 ax.get_yaxis().set_visible(False)
                 ax.grid(True, linestyle=':', alpha=0.5)
@@ -382,15 +403,15 @@ def mvn_pairplot(mu, sigma, title='MVN Density Pairplot',
                 ])
 
                 # Exact analytical 2D Gaussian density calculation
-                mvn_sub = multivariate_normal(mean=mu_sub, cov=sigma_sub)
+                mvn_sub = multivariate_normal(mean=mu_sub, cov=sigma_sub, allow_singular=True)
                 Z = mvn_sub.pdf(pos)
 
                 # Plot the smooth exact continuous density contours
                 ax.contourf(X, Y, Z, levels=10, cmap='Blues', alpha=0.85)
                 ax.contour(X, Y, Z, levels=5, colors='midnightblue', linewidths=0.5, alpha=0.5)
-
-                # Place a crosshair at the exact true mean point
                 ax.scatter(mu[j], mu[i], color='crimson', marker='x', s=40, zorder=5)
+                if true_vals is not None:
+                    ax.scatter(true_vals[j], true_vals[i], color='crimson', marker='x', s=50, zorder=6)
 
                 # Force alignment across columns and rows
                 ax.set_xlim(mins[j], maxs[j])
@@ -403,15 +424,12 @@ def mvn_pairplot(mu, sigma, title='MVN Density Pairplot',
                 ax.set_xlabel(labels[j], fontsize=11, labelpad=10)
             if j == 0 and i > 0:
                 ax.set_ylabel(labels[i], fontsize=11, labelpad=10)
-
-            # Clean up inner ticks to prevent cluttered text overlaps
             if i != dim - 1:
                 ax.tick_params(labelbottom=False)
             if j != 0:
                 ax.tick_params(labelleft=False)
 
-    plt.suptitle(title,
-                 y=0.99, fontsize=13, fontweight='bold', color='midnightblue')
+    plt.suptitle(title, y=0.99, fontsize=13, fontweight='bold', color='midnightblue')
     plt.tight_layout()
     return fig, axes
 
@@ -440,10 +458,11 @@ def tensor_prod(*vectors):
 def contour_plot(X, Y, Z, fig=None, ax=None, vmin=None, vmax=None, cbar=True, **kwargs):
     # 3. Plot the 2D Z array directly
     # Note: x and y tick labels can be specified using xticklabels and yticklabels
+    Z_plot = np.ma.masked_invalid(Z)
     if ax is None:
         fig, ax = plt.subplots(figsize=(6, 5))
     norm = Normalize(vmin=vmin, vmax=vmax)
-    ax.contourf(X, Y, Z, cmap=CMAP, norm=norm)
+    ax.contourf(X, Y, Z_plot, cmap=CMAP, norm=norm)
     if cbar:
         sm = map_color(vmin, vmax)
         fig.colorbar(sm, ax=ax)
