@@ -84,7 +84,7 @@ def setup_config_func(params):
       'force': force_known,
   }
 
-  true_params = {'signal_present': False}
+  true_params = {'': 0.0, 'x,x': 0.0, 'y,y': 0.0}
 
   num_int_knots = 1000
   return DOMAIN, PDE_KWARGS, true_params, num_int_knots

@@ -19,7 +19,7 @@ def setup_config_func(params):
     PDE_KWARGS['trainable'] = ['']
 
     k_sqr = (params['p_m'] ** 2 + params['p_n'] ** 2) * (np.pi ** 2)
-    true_params = {'k_sqr': k_sqr}
+    true_params = {'x,x': 1., 'y,y': 1., '': k_sqr}
     num_int_knots = 2000
     return DOMAIN, PDE_KWARGS, true_params, num_int_knots
 

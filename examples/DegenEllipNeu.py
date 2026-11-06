@@ -143,14 +143,10 @@ def setup_config_func(params):
       'force': force_known,
   }
 
-  true_params = {'b_cross': params['p_b'], 'c_yy': params['p_c']}
+  true_params = {'x,x': 1.0, 'x,y': params['p_b'], 'y,y': params['p_c']}
 
   # Knot allocation resolving highest spatial frequency
-  k_sqr = (params['p_m'] ** 2 + params['p_n'] ** 2) * (np.pi**2)
-  k = np.sqrt(k_sqr)
-  required_knots_per_dim = int(max(30, (k / np.pi) * 6))
-  num_int_knots = required_knots_per_dim**DIM
-
+  num_int_knots = 1000
   return DOMAIN, PDE_KWARGS, true_params, num_int_knots
 
 

@@ -85,7 +85,7 @@ def force(x, p_c, p_gamma, p_m, p_n, p_K, p_L, p_H):
     return amplitude * np.exp(-p_gamma * x[:, 1]) * np.sin(m2 * x[:, 0]) * np.cos(n2 * x[:, 1])
 
 
-def setup_config(params):
+def setup_config_func(params):
     """
     Dynamically maps the parsed terminal arguments into the PDE configuration.
     """
@@ -100,12 +100,12 @@ def setup_config(params):
 
     # PDE: -c^2 u_xx + 1 u_yy + 2\gamma u_y = g(x,y)
     PDE_KWARGS = {
-        'deriv_coef': {'x,x': -wave_speed_sq, 'y,y': 1, 'y': gamma_coeff},
+        'deriv_coef': {'x,x': -1.0, 'y,y': 1., 'y': 1.0},
         'trainable': ['x,x'],
         'force': force_known
     }
 
-    true_params = {'p_c': params['p_c']}
+    true_params = {'x,x': -params['p_c'] ** 2, 'y,y': 1.0, 'y': gamma_coeff}
     num_int_knots = 1000
     return domain, PDE_KWARGS, true_params, num_int_knots
 
@@ -119,7 +119,7 @@ if __name__ == '__main__':
         pde_params=PDE_PARAMS,
         true_sol_with_derivatives=true_sol_with_derivatives,
         boundary_conditions=boundary_conditions,
-        setup_config_func=setup_config,
+        setup_config_func=setup_config_func,
         x_max_size=X_MAX_SIZE,
         oversample=OVERSAMPLE,
     )

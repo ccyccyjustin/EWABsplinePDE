@@ -67,13 +67,16 @@ def true_sol_with_derivatives(x, p_alpha, p_scale, **kwargs):
   # u_y  = Re(f'(z)) =  a * r^(a - 1) * cos((1 - a) * theta)
   # u_xx = Im(f''(z)) = a * (1 - a) * r^(a - 2) * sin((2 - a) * theta)
   # u_yy = -u_xx (harmonic identity)
+  is_zero = x.sum(axis=1) < 1e-6
   u = p_scale * (r**a) * np.sin(a * theta)
   u_x = -p_scale * a * (r ** (a - 1.0)) * np.sin((1.0 - a) * theta)
   u_y = p_scale * a * (r ** (a - 1.0)) * np.cos((1.0 - a) * theta)
+  u_y[is_zero] = np.nan
 
   u_xx = p_scale * a * (1.0 - a) * (r ** (a - 2.0)) * np.sin((2.0 - a) * theta)
   u_yy = -u_xx
   u_xy = -p_scale * a * (1.0 - a) * (r ** (a - 2.0)) * np.cos((2.0 - a) * theta)
+  u_xy[is_zero] = np.nan
 
   derivs = {
       (0, 0): u,
@@ -107,26 +110,25 @@ def setup_config_func(params):
       'force': force_known,
   }
 
-  true_params = {'diff_y': 1.0}
+  true_params = {'': 0.0, 'x,x': 1.0, 'y,y': 1.0}
 
   # Allocate higher resolution near domain bounds
-  num_int_knots = 1000 #45**DIM
-
+  num_int_knots = 1000
   return DOMAIN, PDE_KWARGS, true_params, num_int_knots
 
 
 if __name__ == '__main__':
-  if '-w' not in sys.argv and '--weak_form' not in sys.argv:
-    sys.argv.extend(['-w', '0'])
+    if '-w' not in sys.argv and '--weak_form' not in sys.argv:
+        sys.argv.extend(['-w', '0'])
 
-  run_pde_experiment(
-      pde_name=PDE_NAME,
-      dim=DIM,
-      variables=VARIABLES,
-      pde_params=PDE_PARAMS,
-      true_sol_with_derivatives=true_sol_with_derivatives,
-      boundary_conditions=boundary_conditions,
-      setup_config_func=setup_config_func,
-      x_max_size=X_MAX_SIZE,
-      oversample=OVERSAMPLE,
-  )
+    run_pde_experiment(
+        pde_name=PDE_NAME,
+        dim=DIM,
+        variables=VARIABLES,
+        pde_params=PDE_PARAMS,
+        true_sol_with_derivatives=true_sol_with_derivatives,
+        boundary_conditions=boundary_conditions,
+        setup_config_func=setup_config_func,
+        x_max_size=X_MAX_SIZE,
+        oversample=OVERSAMPLE,
+    )

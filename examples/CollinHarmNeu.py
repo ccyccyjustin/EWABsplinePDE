@@ -93,7 +93,7 @@ def setup_config_func(params):
       'force': force_known,
   }
 
-  true_params = {'diff_y': 1.0, 'vel_x': 0.0}
+  true_params = {'x,x': 1.0, 'y,y': 1.0, 'x': 0.0}
 
   num_int_knots = 1000 #required_knots_per_dim**DIM
 

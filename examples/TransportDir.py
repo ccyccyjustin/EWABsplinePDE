@@ -108,7 +108,7 @@ def setup_config_func(params):
       'force': force_known,
   }
 
-  true_params = {'vel_y': params['p_cy'], 'diff_xx': 0.0}
+  true_params = {'x': 1.0, 'y': params['p_cy'], 'x,x': 0.0}
 
   required_knots_per_dim = int(max(30, params['p_m2'] * 15))
   num_int_knots = required_knots_per_dim**DIM

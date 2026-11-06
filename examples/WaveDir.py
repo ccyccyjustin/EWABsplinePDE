@@ -99,7 +99,7 @@ def force(x, **kwargs):
   return np.zeros(x.shape[0], dtype=float)
 
 
-def setup_config(params):
+def setup_config_func(params):
   """Dynamically maps parsed terminal arguments into the PDE configuration."""
   domain = [(0.0, params['p_L']), (0.0, params['p_H'])]
 
@@ -109,7 +109,7 @@ def setup_config(params):
   )
 
   c = params['p_c']
-  true_params = {'c': c, 'neg_c_sqr': -(c**2)}
+  true_params = {'x,x': -c**2, 'y,y': 1.0}
 
   # Strong Form: u_yy - c^2 * u_xx = 0
   # Locking 'y,y' to 1.0; 'x,x' target is -c^2 (initialized to blind guess -1.0)
@@ -142,7 +142,7 @@ if __name__ == '__main__':
       pde_params=PDE_PARAMS,
       true_sol_with_derivatives=true_sol_with_derivatives,
       boundary_conditions=boundary_conditions,
-      setup_config_func=setup_config,
+      setup_config_func=setup_config_func,
       x_max_size=X_MAX_SIZE,
       oversample=OVERSAMPLE,
   )

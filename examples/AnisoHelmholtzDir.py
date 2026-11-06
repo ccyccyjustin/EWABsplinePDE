@@ -15,7 +15,7 @@ def setup_config_func(params):
 
     alpha = params['p_alpha']
     beta = (params['p_m'] ** 2 + alpha * params['p_n'] ** 2) * (np.pi ** 2)
-    true_params = {'beta': beta, 'alpha': alpha}
+    true_params = {'': beta, 'x,x': 1.0, 'y,y': alpha} #{'beta': beta, 'alpha': alpha}
 
     PDE_KWARGS = {}
     # Strong form: u_xx + alpha * u_yy + beta * u = 0
@@ -23,9 +23,7 @@ def setup_config_func(params):
     PDE_KWARGS['trainable'] = ['', 'y,y']
     PDE_KWARGS['bias_corrected'] = False
 
-    max_freq = max(params['p_m'], params['p_n'], 3.0)
-    required_knots_per_dim = int(max_freq * 5)
-    num_int_knots = required_knots_per_dim ** 2
+    num_int_knots = 1000
 
     return DOMAIN, PDE_KWARGS, true_params, num_int_knots
 

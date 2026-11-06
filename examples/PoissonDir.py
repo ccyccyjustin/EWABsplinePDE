@@ -64,7 +64,7 @@ def force(x, p_m, p_n, p_K, p_L, p_H):
     return p_K * np.cos(m2 * x[:, 0]) * np.cos(n2 * x[:, 1])
 
 
-def setup_config(params):
+def setup_config_func(params):
     """
     Dynamically maps the parsed terminal arguments into the PDE configuration.
     """
@@ -81,7 +81,7 @@ def setup_config(params):
         'force': force_known
     }
 
-    true_params = {'p_a': params['p_a']}
+    true_params = {'x,x': 1.0, 'y,y': params['p_a'] ** 2}
     num_int_knots = 500
     return domain, PDE_KWARGS, true_params, num_int_knots
 
@@ -94,7 +94,7 @@ if __name__ == '__main__':
         pde_params=PDE_PARAMS,
         true_sol_with_derivatives=true_sol_with_derivatives,
         boundary_conditions=boundary_conditions,
-        setup_config_func=setup_config,
+        setup_config_func=setup_config_func,
         x_max_size=X_MAX_SIZE,
         oversample=OVERSAMPLE,
     )
