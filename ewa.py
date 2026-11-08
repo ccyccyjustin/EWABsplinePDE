@@ -49,7 +49,7 @@ def get_deriv_order(deriv_str, variables):
             error_val = int(token) if token.isdigit() else token
             raise ValueError(f'{error_val} not accepted when there are {dim} dimensions with variables {variables}')
 
-    return tuple(deriv_splits)
+    return tuple(int((np.array(deriv_splits) == p).sum()) for p in range(dim))
 
 @util.time_all_methods
 class EWABSplinePDE(BaseEstimator, RegressorMixin):
@@ -118,14 +118,13 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
     def _parse_physics_configuration(self):
         """Parses and validates PDE/Action coefficients into internal mathematical formats."""
         if self.deriv_coef:
-            deriv_keys = [get_deriv_order(k, self.variables) for k in self.deriv_coef.keys()]
-            sorted_coef = sorted(zip(deriv_keys, self.deriv_coef.values()))
+            self.deriv_map = {get_deriv_order(k, self.variables): k for k in self.deriv_coef.keys()}
+            sorted_coef = sorted(zip(self.deriv_map.keys(), self.deriv_coef.values()))
             self._coef_keys, self._initial_coef_vals = zip(*sorted_coef)
             self.mode = 'PDE'
         else:
             raise ValueError("Must provide physics constraints via deriv_coef or action_coef.")
 
-        self._coef_keys = [tuple(int((np.array(k) == p).sum()) for p in range(self.dim)) for k in self._coef_keys]
         self.coef_keys = [self.format_deriv_orders(k) for k in self._coef_keys]
         self._initial_coef_vals = np.array(self._initial_coef_vals, dtype=float)
         self._zero_deriv = tuple([0] * self.dim)
@@ -181,7 +180,7 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
                     k_tuple = tuple(get_deriv_order(ki, self.variables) for ki in k)
                 else:
                     k_tuple = get_deriv_order(k, self.variables)
-                k_tuple = tuple(int((np.array(k_tuple) == p).sum()) for p in range(self.dim))
+                # k_tuple = tuple(int((np.array(k_tuple) == p).sum()) for p in range(self.dim))
                 trainable_list.append(k_tuple)
             t_str = list(map(str, trainable_list))
             k_str = list(map(str, self._coef_keys))
@@ -550,7 +549,8 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
             for j, k_j in enumerate(self._coef_keys):
                 penalty_matrix += coef_vals[i] * coef_vals[j] * self._omega_dict[(k_i, k_j)]
 
-        assert np.abs(penalty_matrix - penalty_matrix.T).max() < self.tol
+        assert np.abs(penalty_matrix - penalty_matrix.T).max() < self.tol, (
+            np.abs(penalty_matrix - penalty_matrix.T).max(), coef_vals)
         penalty_matrix = (penalty_matrix + penalty_matrix.T) / 2.0
 
         # --- 2. Hard Constrained Reduced Space Projection ---
@@ -559,7 +559,7 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
             if not sp.issparse(penalty_matrix) and sp.issparse(T_mat):
                 T_mat = T_mat.toarray()
             A_reduced = T_mat.T @ penalty_matrix @ T_mat
-            v_reduced = T_mat.T @ (forcing_vector - penalty_matrix @ self.d_vec_)
+            v_reduced = T_mat.T @ (forcing_vector - np.array(penalty_matrix @ self.d_vec_).ravel())
             return A_reduced, v_reduced
 
         return penalty_matrix, forcing_vector
@@ -582,10 +582,10 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
                     omega_uv = omega_uv.toarray()
                 omega_uv = np.asarray(omega_uv)
                 G = beta.T @ omega_uv @ beta
-                if bias_corrected:
-                    bias = np.sum(self.Vw * (omega_uv @ self.Vw)) #np.sum(diag_K_uv * M_squared)
-                    bias = bias * (sigma ** 2 / self.n_train)
-                    G = G - bias
+                # if bias_corrected:
+                #     bias = np.sum(self.Vw * (omega_uv @ self.Vw)) #np.sum(diag_K_uv * M_squared)
+                #     bias = bias * (sigma ** 2 / self.n_train)
+                #     G = G - bias
                 Gram[i, j] = G
 
         proj_vec = np.zeros(m)
@@ -623,9 +623,9 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
         G_TT = G[np.ix_(T, T)]
         self.G_TT = G_TT
         if np.linalg.eigvals(G_TT).min() < self.tol:
-            logger.warning('Trainable Gram not Positive!')
+            logger.warning('theta eq. not Positive!')
         if np.linalg.cond(G_TT) > 1 / self.tol:
-            logger.warning('Trainable Gram not Invertible!')
+            logger.warning('theta eq. not Invertible!')
         GTT_inv = np.linalg.inv(G_TT)
 
         # 1. Calculate the pure OLS target
@@ -638,6 +638,40 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
 
         # 2. Apply Momentum / Over-Relaxation to accelerate the tail convergence
         theta_new[T] = deriv_coef[T] + relaxation * (c_calc - deriv_coef[T])
+        return theta_new
+
+    def get_coef_dist_corrected(self, G, deriv_coef, v_vec, A, B, relaxation=1.0):
+        """
+        Solves the symmetric, PSD Godambe information system:
+            (A^T @ B_inv @ A + mu * I) @ Delta_theta_T = -A^T @ B_inv @ Psi
+        where:
+            A: Bread matrix (J_TT + M_ind)
+            B: Meat matrix (score covariance)
+            Psi: G_TT @ theta_T + G_TTc @ theta_Tc - v_T
+        """
+        T = self._trainable_idx
+        Tc = [i for i, _ in enumerate(self._coef_keys) if i not in T]
+        theta_new = deriv_coef.copy()
+        theta_T_old = deriv_coef[T]
+
+        G_TT = G[np.ix_(T, T)]
+        self.G_TT = G_TT
+
+        # 1. Compute estimating equation residual Psi(theta^(t))
+        Psi = G_TT @ theta_T_old - v_vec[T]
+        if len(Tc) > 0:
+            Psi += G[np.ix_(T, Tc)] @ deriv_coef[Tc]
+
+        # 2. Invert Meat matrix B with Tikhonov safeguard
+        B_inv = np.linalg.inv(B)
+
+        # 3. Assemble symmetric, PSD system matrix S and RHS gradient
+        S = A.T @ B_inv @ A
+        rhs_grad = -A.T @ (B_inv @ Psi)
+        delta_theta = np.linalg.solve(S, rhs_grad)
+
+        # 6. Successive Over-Relaxation (SOR) update
+        theta_new[T] = theta_T_old + relaxation * delta_theta
         return theta_new
 
     def project_bc(self, bc_func, d, x_star):
@@ -885,10 +919,14 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
             gram_matrices, proj_vec, J_phi = self.compute_theta_system_pde(self._omega_dict,
                                                                            self.beta_full_,
                                                                            coef_vals,
-                                                                           bias_corrected=self.bias_corrected,
                                                                            sigma=self.sigma_est_,)
 
-            coef_mean = self.get_coef_dist(gram_matrices, coef_vals, proj_vec)
+            if not self.bias_corrected:
+                coef_mean = self.get_coef_dist(gram_matrices, coef_vals, proj_vec)
+            else:
+                A, B, _, _, _ = self.compute_asymptotic_variance(coef_vals, self.ewa_res_, self.y_adj_, self.force_proj,
+                                                                                lam_vec=self.lam_grid_, U=self.U_, V=self.V_, s=self.s_)
+                coef_mean = self.get_coef_dist_corrected(gram_matrices, coef_vals, proj_vec, A, B)
 
             w = self.ewa_res_['weights']
             lamb_mean = (self.lam_grid_ * w).sum()
@@ -925,10 +963,10 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
             #     break
 
         # --- Finalize Fitted State ---
-        self.deriv_coef_vals_ = coef_vals
+        self.deriv_coef = {self.deriv_map[self._coef_keys[i]]: v for i, v in enumerate(coef_vals)} #coef_vals
         self.coef_mean = coef_mean
 
-        self.bread_matrix, self.meat_matrix, self.cov_beta_sqrt = self.compute_asymptotic_variance(self.coef_mean, self.ewa_res_, self.y_adj_, self.force_proj,
+        self.bread_matrix, self.meat_matrix, self.cov_beta_sqrt, _, _ = self.compute_asymptotic_variance(self.coef_mean, self.ewa_res_, self.y_adj_, self.force_proj,
                                                                                                    lam_vec=self.lam_grid_, U=self.U_, V=self.V_, s=self.s_)
         bread_inv = np.linalg.inv(self.bread_matrix)
         self.coef_var = bread_inv @ self.meat_matrix @ bread_inv.T
@@ -1174,7 +1212,7 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
         A = J_TT + K_tilde @ J_alpha_EWA # Extra non-linear term! K_tilde @ J_alpha_EWA!
         K_Xi = K_tilde @ Xi  # (K, p_red)
         B = (sig2 / n) * (K_Xi @ K_Xi.T)  # (K, K)
-        return A, B, cov_beta_sqrt
+        return A, B, cov_beta_sqrt, K_tilde, J_alpha_EWA
 
     def plot_fit_stats(self, logy=True, **kwargs):
         """Plots Training Losses and Lambda distribution evolution in a single figure."""
@@ -1259,8 +1297,9 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
 
         # --- 2. Compute Pointwise PDE Loss (Learnt Parameters) ---
         pde_loss_learnt = -self.force(x_grid).ravel()
-        for i, order in enumerate(self._coef_keys):
-            pde_loss_learnt += self.deriv_coef_vals_[i] * self.predict_derivative(x_grid, order)
+        for i, (k, v) in enumerate(self.deriv_coef.items()):
+            order = self._coef_keys[i]
+            pde_loss_learnt += v * self.predict_derivative(x_grid, order)
 
         # --- 3. Compute Pointwise PDE Loss (True Parameters) ---
         pde_loss_true = None

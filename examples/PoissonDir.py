@@ -76,7 +76,7 @@ def setup_config_func(params):
 
     # --- Exact Original Parameter Settings Retained ---
     PDE_KWARGS = {
-        'deriv_coef': {'x,x': 1, 'y,y': 3},
+        'deriv_coef': {'x,x': 1, 'y,y': 2},
         'trainable': ['y,y'],
         'force': force_known
     }

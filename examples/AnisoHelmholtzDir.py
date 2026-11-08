@@ -21,8 +21,6 @@ def setup_config_func(params):
     # Strong form: u_xx + alpha * u_yy + beta * u = 0
     PDE_KWARGS['deriv_coef'] = {'': 1.0, 'x,x': 1.0, 'y,y': 1.0}
     PDE_KWARGS['trainable'] = ['', 'y,y']
-    PDE_KWARGS['bias_corrected'] = False
-
     num_int_knots = 1000
 
     return DOMAIN, PDE_KWARGS, true_params, num_int_knots

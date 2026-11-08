@@ -12,6 +12,7 @@ from typing import Optional, Dict, List, Tuple, Union, Callable
 import ewa
 import util
 from ewa import EWABSplinePDE
+from ewa_op import FunctionalEWABSplinePDE
 from util import canberra_similarity, parallel, tensor_prod, CMAP
 from scipy.stats import norm
 
@@ -68,7 +69,8 @@ def align_pde_params(
     res: Optional[Union[pd.Series, pd.DataFrame]] = None,
     pde_kwargs: Optional[dict] = None,
     variables: Optional[List[str]] = None,
-    dim: Optional[int] = None
+    dim: Optional[int] = None,
+    model_class=None,
 ) -> pd.DataFrame:
     """
     Aligns true_params with the model coefficients using exact derivative keys ('', 'x,x', 'y,y').
@@ -76,9 +78,9 @@ def align_pde_params(
     """
     # If model is not provided (e.g., at line 774 outside run_one), build a lightweight metadata instance
     if model is None:
-        if pde_kwargs is None or variables is None or dim is None:
+        if pde_kwargs is None or variables is None or dim is None or model_class is None:
             raise ValueError("Must provide either 'model' or ('pde_kwargs', 'variables', 'dim').")
-        model = EWABSplinePDE(dim=dim, variables=variables, **pde_kwargs)
+        model = model_class(dim=dim, variables=variables, **pde_kwargs)
         model._parse_physics_configuration()
 
     K = len(model._coef_keys)
@@ -96,32 +98,19 @@ def align_pde_params(
         for r in range(dim_v):
             for c in range(dim_v):
                 coef_var[r, c] = float(res.get(f'coef_var_{r}_{c}', 0.0))
-    elif hasattr(model, 'deriv_coef_vals_'):
-        coef_mean = model.deriv_coef_vals_
+    else:
+        coef_mean = model.coef_mean
         coef_var = model.coef_var
         dim_v = coef_var.shape[0]
-    else:
-        coef_mean = model._initial_coef_vals
-        coef_var = np.zeros((len(T), len(T)))
-        dim_v = len(T)
 
     is_active_only = (dim_v == len(T) and len(T) < K)
-
-    # 2. Parse true_params using the model's variable mapping ('', 'x,x', 'y,y')
-    parsed_true = {}
-    if true_params is not None and isinstance(true_params, dict):
-        for k_str, val in true_params.items():
-            if isinstance(val, (int, float)):
-                ax_tup = ewa.get_deriv_order(k_str, model.variables)
-                d_ord = tuple(int((np.array(ax_tup) == p).sum()) for p in range(model.dim))
-                parsed_true[d_ord] = float(val)
 
     # 3. Assemble aligned summary table
     rows = []
     for i in range(K):
         d_ord = model._coef_keys[i]
         op_label = model.coef_keys[i]
-        raw_key = model._raw_str_names[i] if hasattr(model, '_raw_str_names') else ''
+        raw_key = model.deriv_map[d_ord]
         is_trainable = (i in T)
         role = "Trainable" if is_trainable else "Locked"
 
@@ -133,7 +122,7 @@ def align_pde_params(
 
         se_i = float(np.sqrt(max(var_i, 0.0)))
         est_val = float(coef_mean[i])
-        true_val = parsed_true.get(d_ord, np.nan)
+        true_val = true_params.get(raw_key, np.nan)
 
         if not is_trainable and np.isnan(true_val):
             true_val = est_val
@@ -514,7 +503,8 @@ def plot_res_summary(
         param_df: pd.DataFrame | dict = None,
         pde_name: str = "PDE Benchmark",
         save_path: str = None,
-        metric_suffix: str = "test"
+        metric_suffix: str = "test",
+        annot=False
 ):
     """
     4-panel publication dashboard with native MultiIndex / comparative group support:
@@ -525,44 +515,95 @@ def plot_res_summary(
     df = res.to_frame().T if isinstance(res, pd.Series) else res
     df = df.astype(float)
 
-    # 1. Detect MultiIndex or Grouping
+    # =========================================================================
+    # 1. MultiIndex Detection & Group Extraction
+    # =========================================================================
     is_multi = False
     groups = [None]
     group_labels = ["All"]
-    group_colors = ["#1f77b4"]
+    badge_prefixes = [""]
+    grp_level_names = []
+    grp_levels = []
 
     if isinstance(df.index, pd.MultiIndex):
         is_multi = True
-        groups = list(dict.fromkeys(df.index.get_level_values(0)))
+        # Exclude internal iteration/sample level if present at innermost level
+        if df.index.nlevels > 1 and df.index.names[-1] in ('iter', 'iteration', 'rep', None):
+            grp_levels = list(range(df.index.nlevels - 1))
+        else:
+            grp_levels = list(range(df.index.nlevels))
+
+        grp_level_names = [df.index.names[i] or f"Level_{i}" for i in grp_levels]
+
+        # Extract unique group tuples in order of appearance
+        if len(grp_levels) == df.index.nlevels:
+            groups = list(dict.fromkeys(df.index.tolist()))
+        else:
+            drop_lvls = [i for i in range(df.index.nlevels) if i not in grp_levels]
+            grp_index = df.index.droplevel(drop_lvls)
+            groups = list(dict.fromkeys(grp_index.tolist()))
+
     elif "weak" in df.columns:
         is_multi = True
         groups = list(dict.fromkeys(df["weak"]))
+        grp_level_names = ["weak"]
+
+    # =========================================================================
+    # 2. Adaptive Group Label Formatting
+    # =========================================================================
+    palette = ["#1f77b4", "#e6550d", "#2ca02c", "#7b3294", "#d62728", "#8c564b", "#e377c2", "#17becf"]
+    n_groups = len(groups)
+    group_colors = [palette[i % len(palette)] for i in range(n_groups)]
+
+    def _format_token(name: str, val, short: bool = False):
+        """Translates known experimental parameter names into clean typography."""
+        name_lower = str(name).lower()
+        v_int = int(val) if isinstance(val, (int, float, np.integer, np.floating)) and np.isclose(val,
+                                                                                                  int(val)) else val
+
+        if name_lower == "weak":
+            if short:
+                return "Weak" if v_int == 1 else "Strong"
+            return "Weak Form" if v_int == 1 else "Strong Form"
+
+        if name_lower in ("bias_correct", "bias_corrected", "bc"):
+            if short:
+                return "+BC" if v_int == 1 else ""
+            return "Bias-Corrected" if v_int == 1 else "Uncorrected"
+
+        if name_lower in ("quantile", "quantile_based"):
+            if short:
+                return "+Qtl" if v_int == 1 else "+Uni"
+            return "Quantile Knots" if v_int == 1 else "Uniform Knots"
+
+        # Generic parameter fallback
+        return f"{name}={v_int}"
 
     if is_multi:
         palette = ["#1f77b4", "#e6550d", "#2ca02c", "#7b3294"]
         group_colors = [palette[i % len(palette)] for i in range(len(groups))]
 
-        def format_grp_label(g):
-            sg = str(g)
-            if sg == "0":
-                return "Strong Form"
-            elif sg == "1":
-                return "Weak Form"
-            return f"Group {sg}"
+        def _format_token(name: str, val, short: bool = False):
+            v_int = int(val) if isinstance(val, (int, float, np.integer, np.floating)) and np.isclose(val,
+                                                                                                      int(val)) else val
+            return f"{name}={v_int}"
 
-        group_labels = [format_grp_label(g) for g in groups]
+        group_labels, badge_prefixes = [], []
+        for g in groups:
+            vals = g if isinstance(g, (tuple, list)) else [g]
+            group_labels.append(" | ".join(_format_token(n, v, False) for n, v in zip(grp_level_names, vals)))
+            b_tokens = [_format_token(n, v, True) for n, v in zip(grp_level_names, vals)]
+            badge_prefixes.append(f"{''.join(b_tokens).strip('+')}: ")
 
-    n_groups = len(groups)
-    width = 0.35 if n_groups == 2 else (0.6 / n_groups if n_groups > 1 else 0.45)
+    width = 0.35 if n_groups == 2 else (0.75 / n_groups if n_groups > 1 else 0.45)
     offsets = np.linspace(-width * (n_groups - 1) / 2, width * (n_groups - 1) / 2, n_groups) if n_groups > 1 else [0.0]
 
-    # Helper to slice DataFrame per group
     def get_df_group(g):
-        if not is_multi:
-            return df
         if isinstance(df.index, pd.MultiIndex):
-            return df.xs(g, level=0)
-        return df[df["weak"] == g]
+            lvl_arg = grp_levels[0] if len(grp_levels) == 1 else grp_levels
+            return df.xs(g, level=lvl_arg)
+        else:
+            return df
 
     # Helper to extract metrics safely
     def get_val(sub_df: pd.DataFrame, key: str) -> np.ndarray:
@@ -613,17 +654,18 @@ def plot_res_summary(
             all_max_sob = max(all_max_sob, np.max(data) if len(data) > 0 else 1.0)
             ha = "right" if (is_multi and g_idx == 0) else ("left" if is_multi else "center")
             x_shift = -3 if (is_multi and g_idx == 0) else (3 if is_multi else 0)
-            ax1.annotate(
-                f"{med:.3f}%",
-                xy=(pos[i], med),
-                xytext=(x_shift, 4),
-                textcoords="offset points",
-                ha=ha,
-                va="bottom",
-                fontsize=8,
-                fontweight="bold",
-                color=group_colors[g_idx] if is_multi else "#12466b"
-            )
+            if annot:
+                ax1.annotate(
+                    f"{med:.3f}%",
+                    xy=(pos[i], med),
+                    xytext=(x_shift, 4),
+                    textcoords="offset points",
+                    ha=ha,
+                    va="bottom",
+                    fontsize=8,
+                    fontweight="bold",
+                    color=group_colors[g_idx] if is_multi else "#12466b"
+                )
 
     ax1.set_xticks(x)
     ax1.set_xticklabels([lbl for _, lbl in sob_items], fontsize=10)
@@ -673,17 +715,18 @@ def plot_res_summary(
             all_max_sp = max(all_max_sp, np.max(data) if len(data) > 0 else 0.01)
             y_shift = -3 if (is_multi and g_idx == 0) else (3 if is_multi else 0)
             va = "top" if (is_multi and g_idx == 0) else ("bottom" if is_multi else "center")
-            ax2.annotate(
-                f"{med:.4f}",
-                xy=(med, pos[i]),
-                xytext=(4, y_shift),
-                textcoords="offset points",
-                ha="left",
-                va=va,
-                fontsize=7.5,
-                fontweight="bold",
-                color=group_colors[g_idx] if is_multi else "black"
-            )
+            if annot:
+                ax2.annotate(
+                    f"{med:.4f}",
+                    xy=(med, pos[i]),
+                    xytext=(4, y_shift),
+                    textcoords="offset points",
+                    ha="left",
+                    va=va,
+                    fontsize=7.5,
+                    fontweight="bold",
+                    color=group_colors[g_idx] if is_multi else "black"
+                )
 
     ax2.set_yticks(y_pos)
     ax2.set_yticklabels([lbl for _, lbl in sp_items], fontsize=9)
@@ -729,17 +772,18 @@ def plot_res_summary(
             min_emp = min(min_emp, np.min(data) if len(data) > 0 else 80.0)
             ha = "right" if (is_multi and g_idx == 0) else ("left" if is_multi else "center")
             x_shift = -3 if (is_multi and g_idx == 0) else (3 if is_multi else 0)
-            ax3.annotate(
-                f"{med:.1f}%",
-                xy=(pos[i], med),
-                xytext=(x_shift, 4),
-                textcoords="offset points",
-                ha=ha,
-                va="bottom",
-                fontsize=8,
-                fontweight="bold",
-                color=group_colors[g_idx] if is_multi else "black"
-            )
+            if annot:
+                ax3.annotate(
+                    f"{med:.1f}%",
+                    xy=(pos[i], med),
+                    xytext=(x_shift, 4),
+                    textcoords="offset points",
+                    ha=ha,
+                    va="bottom",
+                    fontsize=8,
+                    fontweight="bold",
+                    color=group_colors[g_idx] if is_multi else "black"
+                )
 
     ax3.set_xticks(xc)
     ax3.set_xticklabels(["90% CI", "95% CI", "99% CI"], fontsize=10)
@@ -863,8 +907,6 @@ def plot_res_summary(
 
             min_len = min(len(ests), len(vars_))
             ests = ests[:min_len]
-            #vars_ = np.atleast_1d(vars_[:min_len])
-            # vars_ = np.array(vars_[:min_len], dtype=float)
             ses = np.sqrt(np.maximum(vars_[:min_len], 1e-16))
 
             # (c) Calculate studentized z-scores
@@ -918,7 +960,8 @@ def plot_res_summary(
         for g_idx in range(n_groups):
             zd = all_z_groups[g_idx][i]
             pos_y = y_p[i] + offsets[g_idx]
-            n_obs = df_g['n_obs'].iloc[0]
+            df_g_curr = get_df_group(groups[g_idx])
+            n_obs = int(df_g_curr['n_obs'].iloc[0])
 
             if len(zd) > 0:
                 med = np.median(zd)
@@ -927,10 +970,8 @@ def plot_res_summary(
             else:
                 med, cov, med_se_norm = 0.0, 0.0, 0.0
 
-            grp_prefix = (
-                f"{group_labels[g_idx].split()[0]}: " if is_multi else ""
-            )
-            badge_text = rf"{grp_prefix}Cov={cov:.1%} ($\sqrt{{n}}$SE={med_se_norm:.3g}"
+            grp_prefix = badge_prefixes[g_idx] if is_multi else ""
+            badge_text = rf"Cov={cov:.0%}, aSE={med_se_norm:.3g}"
 
             ax4.annotate(
                 badge_text,
@@ -988,7 +1029,7 @@ def plot_res_summary(
         facecolor="white",
     )
 
-    title_suffix = " (Strong vs. Weak Formulation)" if is_multi else ""
+    title_suffix = f" (Comparing {', '.join(grp_level_names)})" if is_multi else ""
     fig.suptitle(f"EWABSplinePDE Summary Statistics: {pde_name}{title_suffix}", fontsize=14, fontweight="bold")
 
     if save_path:
@@ -1019,6 +1060,7 @@ def run_pde_experiment(
     parser.add_argument("-s", "--save", type=str, default='1')
     parser.add_argument("-d", "--debug", type=str, default='0')
     parser.add_argument("-w", "--weak_form", type=str, default='0')
+    parser.add_argument("-b", "--bias_corrected", type=str, default='1')
 
     for p_name, p_dict in pde_params.items():
         p_flag = p_dict['flag']
@@ -1036,6 +1078,7 @@ def run_pde_experiment(
     debug = to_bool(args.debug)
     quantile_based = to_bool(args.quantile)
     weak_form = to_bool(args.weak_form)
+    bias_corrected = to_bool(args.bias_corrected)
 
     if debug:
         n_iter = 1
@@ -1045,6 +1088,11 @@ def run_pde_experiment(
 
     # Calculate required knots and metadata specific to this PDE
     domain, pde_kwargs, true_params, num_int_knots = setup_config_func(params)
+    if any(['operator' in k.lower() for k in pde_kwargs.keys()]):
+        MOD = FunctionalEWABSplinePDE
+        weak_form = True  # TODO?
+    else:
+        MOD = EWABSplinePDE
 
     # print(f'Sample Size: {n}')
 
@@ -1081,9 +1129,9 @@ def run_pde_experiment(
             dataset.to_csv(f'/Users/cheungjustin/PDE/EWA/dataset/{pde_name}.csv')
 
         # print(f"True Sigma: {sigma_scaled}")
-        model = EWABSplinePDE(dim=dim, variables=variables, domain=domain, boundary_conditions=bc_dict,
+        model = MOD(dim=dim, variables=variables, domain=domain, boundary_conditions=bc_dict,
                               alpha=alpha, quantile_based=quantile_based, num_int_knots=num_int_knots,
-                              total_grid_size=10000, weak_form=weak_form,
+                              total_grid_size=10000, weak_form=weak_form, bias_corrected=bias_corrected,
                               **pde_kwargs)
         model.fit(x_train, y_train)
 
@@ -1128,8 +1176,8 @@ def run_pde_experiment(
             # model.galerkin_force_diagnostics()
             # model.galerkin_penalty_diagnostics()
 
-            # trainable_true_vals = param_df.iloc[model._trainable_idx]['True_Value'].values
-            # model.plot_coef_dist(true_vals=trainable_true_vals)
+            trainable_true_vals = param_df.iloc[model._trainable_idx]['True_Value'].values
+            model.plot_coef_dist(true_vals=trainable_true_vals)
 
             # Plot True Solution (If 2D)
             # if debug and (dim == 2):
@@ -1145,10 +1193,10 @@ def run_pde_experiment(
             #     plt.show()
 
             # Plot Fitted
-            # model.plot_fit(x_test=x_test, y_test=y_test)
-            # model.plot_lambda_weight()
-            # model.plot_eigenvalues()
-            # model.plot_basis_functions()
+            #model.plot_fit(x_test=x_test, y_test=y_test)
+            model.plot_lambda_weight()
+            model.plot_eigenvalues()
+            model.plot_basis_functions()
 
         return res_series
 
@@ -1162,7 +1210,8 @@ def run_pde_experiment(
         res=res_df,
         pde_kwargs=pde_kwargs,
         variables=variables,
-        dim=dim
+        dim=dim,
+        model_class=MOD
     )
     print(f"\n================ {pde_name} Parameter Recovery Table ================")
     print(final_param_df.to_string(index=False, float_format=lambda x: f"{x:.4e}"))
