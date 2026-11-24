@@ -8,6 +8,7 @@ from sklearn.base import BaseEstimator, RegressorMixin
 from sklearn.utils.validation import check_X_y, check_array, check_is_fitted
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
+from scipy.linalg import eigh
 
 import util
 from itertools import product
@@ -62,7 +63,8 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
                  deg: int = 3,
                  variables: Optional[List[str]] = None,
                  weak_form: bool = False,
-                 bias_corrected: bool = False,
+                 bias_corrected: bool = True,
+                 accelerate: bool = False,
                  deriv_coef: Dict[str, float] = None,
                  force: callable = None,
                  boundary_conditions: dict = {},
@@ -70,7 +72,8 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
                  max_iter: int = 100,
                  min_param_pct_chg: float = 1e-4,
                  domain: Optional[List[Tuple[float, float]]] = None,
-                 num_int_knots: Optional[int] = None,
+                 min_samples_per_cell: int = 3,
+                 num_knots_1d_target: Optional[int] = 30,
                  quantile_based: bool = False,
                  total_grid_size: int = 1000,
                  sigma: Optional[float] = None,
@@ -89,6 +92,7 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
 
         self.weak_form = weak_form
         self.bias_corrected = bias_corrected
+        self.accelerate = accelerate
         self.deriv_coef = deriv_coef or {}
         self.force = force or (lambda s: np.zeros(s.shape[0]))
         self.boundary_conditions = boundary_conditions
@@ -97,7 +101,8 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
         self.max_iter = max_iter
         self.min_param_pct_chg = min_param_pct_chg
         self.domain = domain
-        self.num_int_knots = num_int_knots
+        self.min_samples_per_cell = min_samples_per_cell
+        self.num_knots_1d_target = num_knots_1d_target
         self.quantile_based = quantile_based
         self.total_grid_size = total_grid_size
 
@@ -190,49 +195,30 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
             deriv_order = list(map(len, self._coef_keys))
             self._trainable_idx = [i for i, order in enumerate(deriv_order) if order < max(deriv_order)]
 
-    def design_knots(self, X, y, gamma=3.0, **kwargs):
-        from scipy.special import bernoulli, factorial
-        N = X.shape[0]
-        domain_size = self.domain[:, 1] - self.domain[:, 0]
+    def design_knots(self, X):
+        n, d = X.shape
+        p = self.deg
+        K_1d_small_ss = (n / self.min_samples_per_cell) ** (1 / d)
 
-        # Estimate the grad norm of the scaled function
-        X_scaled = (X - self.domain[:, 0]) / domain_size
-        s2, grad2, y_smooth = util.estimate_aniso(X_scaled, y, **kwargs)
+        asym_order = 1 / (2 * (p + 1) + d)
+        n_cutoff = self.min_samples_per_cell * (self.num_knots_1d_target ** d)
+        scaling_const = self.num_knots_1d_target * (n_cutoff ** (-asym_order))
+        K_1d_asym = scaling_const * (n ** asym_order)
 
-        # Estimate Data Frequency and enery norm up to 1st order
-        V = np.prod(domain_size)
-        I_0 = np.mean(y_smooth ** 2) * V
-        I_1 = grad2 / (domain_size ** 2) * V
-        knot_ratio = np.sqrt(I_1) * domain_size #np.sqrt(grad2 / V)
+        K_1d = min(K_1d_small_ss, K_1d_asym)
+        K_1d = K_1d - (p + 1)
+        K_1d = max(1, int(K_1d))
 
-        q0, q = 2, 2 * (self.deg + 1)
-        data_snr = (N / V / s2) ** (1 / (q + self.dim))
-        spline_coef = q0 * np.abs(bernoulli(q0)[-1]) / factorial(q0)
-        spline_knots_factor = data_snr * (spline_coef / np.prod(knot_ratio)) ** (1 / (q0 + self.dim))
-        spline_knots = knot_ratio * spline_knots_factor
-
-        omega = np.sqrt(I_1 / I_0)
-        spline_knots_freq = (gamma ** (1/self.dim)) * (domain_size * omega) / np.pi
-        spline_knots = np.maximum(spline_knots, spline_knots_freq)
-
-        logger.info(f'Estimated sigma^2: {np.sqrt(s2): .4f}, '
-              f'1st order norm: {np.sqrt(I_1)}, '
-              f'Frequency (Hertz): {omega / 2 / np.pi}, '
-              f'allocating splines knots: {spline_knots}')
-        return spline_knots
+        n_knots = np.repeat(K_1d, self.dim).astype(int)
+        self.num_int_knots = np.prod(n_knots)
+        return n_knots
 
     def generate_knots(self, X, y):
-        n_samples = X.shape[0]
-        dim = X.shape[1]
         self.a_, self.b_ = X.min(axis=0), X.max(axis=0)
         self.domain = self.domain or list(zip(self.a_, self.b_))
         self.domain = np.array(self.domain)
 
-        if self.num_int_knots is None:
-            n_knots = self.design_knots(X, y).astype(int)
-        else:
-            self.num_int_knots = min(self.num_int_knots, n_samples // 3) # Avoid Singularity...
-            n_knots = np.repeat(self.num_int_knots ** (1 / dim), self.dim).astype(int)
+        n_knots = self.design_knots(X)
 
         if self.sparse is None:
             self.sparse = np.prod(n_knots) > 3000
@@ -241,8 +227,8 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
             self.int_knots_ = [np.percentile(X[:, i], np.linspace(0, 100, n_knots[i] + 2)[1:-1])
                                for i in range(X.shape[1])]
         else:
-            self.int_knots_ = [np.linspace(*d, n_knots[i] + 2 + 3*i)[1:-1]
-                               for i, d in enumerate(self.domain)] #TODO!!!! remove + 3d
+            self.int_knots_ = [np.linspace(*d, n_knots[i] + 2)[1:-1]
+                               for i, d in enumerate(self.domain)]
 
         self.step_size = [np.diff(knt).mean() for knt in self.int_knots_]
 
@@ -339,6 +325,10 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
         lam_grid = np.linspace(0, 1, self.lam_size)[1:-1]
         prior = np.ones(len(lam_grid))
         prior = prior / prior.sum()
+
+        # TODO: Stiff PDE...
+        # tau = np.geomspace(1e-10, 1e6, 1000)
+        # lam = tau / (1 + tau)
 
         # log_lams = np.arange(self.log_lamb[0], self.log_lamb[1], self.log_lamb_step)
         # lam_grid = np.exp(log_lams)
@@ -574,19 +564,44 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
         m = len(self._coef_keys)
         n = len(beta)
 
-        Gram = np.zeros((m, m))
+        G_raw = np.zeros((m, m))
+        G_bias = np.zeros((m, m))
+
         for i, k_u in enumerate(self._coef_keys):
             for j, k_v in enumerate(self._coef_keys):
                 omega_uv = self._omega_dict[(k_u, k_v)]
                 if hasattr(omega_uv, "toarray"):
                     omega_uv = omega_uv.toarray()
                 omega_uv = np.asarray(omega_uv)
-                G = beta.T @ omega_uv @ beta
-                # if bias_corrected:
-                #     bias = np.sum(self.Vw * (omega_uv @ self.Vw)) #np.sum(diag_K_uv * M_squared)
-                #     bias = bias * (sigma ** 2 / self.n_train)
-                #     G = G - bias
-                Gram[i, j] = G
+                g_val = beta.T @ omega_uv @ beta
+                G_raw[i, j] = g_val
+
+                if bias_corrected:
+                    bias = np.sum(self.Vw * (omega_uv @ self.Vw)) #np.sum(diag_K_uv * M_squared)
+                    bias = bias * (sigma ** 2 / self.n_train)
+                    G_bias[i, j] = bias
+
+        # Add a Guarantee that the De-biased G_TT is PSD
+        if bias_corrected and len(self._trainable_idx) > 0:
+            T = self._trainable_idx
+            G_raw_TT = G_raw[np.ix_(T, T)]
+            G_bias_TT = G_bias[np.ix_(T, T)]
+            # Consistent generalized-eigenvalue damping: guarantees
+            # G_raw_TT - eta * G_bias_TT >= eps_floor * G_raw_TT > 0
+            eps_floor = 0.05
+            try:
+                mu_max = float(np.max(eigh(G_bias_TT, G_raw_TT, eigvals_only=True)))
+            except np.linalg.LinAlgError:
+                mu_max = np.inf
+            if mu_max <= 1.0 - eps_floor:
+                eta = 1.0
+            elif np.isfinite(mu_max) and mu_max > 0.0:
+                eta = (1.0 - eps_floor) / mu_max
+            else:
+                eta = 0.0
+            Gram = G_raw - eta * G_bias
+        else:
+            Gram = G_raw
 
         proj_vec = np.zeros(m)
         for i, _ in enumerate(self._coef_keys):
@@ -640,37 +655,57 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
         theta_new[T] = deriv_coef[T] + relaxation * (c_calc - deriv_coef[T])
         return theta_new
 
-    def get_coef_dist_corrected(self, G, deriv_coef, v_vec, A, B, relaxation=1.0):
+    def get_coef_dist_corrected(
+            self,G,deriv_coef,v_vec,A,B=None,
+            relaxation=0.7,max_rel_step=0.5,lm_damping=1e-3,
+    ):
         """
-        Solves the symmetric, PSD Godambe information system:
-            (A^T @ B_inv @ A + mu * I) @ Delta_theta_T = -A^T @ B_inv @ Psi
-        where:
-            A: Bread matrix (J_TT + M_ind)
-            B: Meat matrix (score covariance)
-            Psi: G_TT @ theta_T + G_TTc @ theta_Tc - v_T
+        Stabilized damped Newton update for the just-identified estimating equation:
+            Psi(theta_T) = G_TT @ theta_T + G_TTc @ theta_Tc - v_T = 0
+        using the coupled Jacobian A = J_TT + M_ind.
+
+        Stability safeguards:
+          1. Avoids inverting B (not needed for just-identified root-finding).
+          2. Continuous Levenberg-Marquardt regularization on A if Re(eig(A)) <= tol.
+          3. Relative step-size trust-region clipping to prevent Gibbs-weight overshoots.
+          4. Damped relaxation (relaxation < 1) for alternating BCD stability.
         """
         T = self._trainable_idx
         Tc = [i for i, _ in enumerate(self._coef_keys) if i not in T]
         theta_new = deriv_coef.copy()
         theta_T_old = deriv_coef[T]
+        dim_T = len(T)
 
         G_TT = G[np.ix_(T, T)]
         self.G_TT = G_TT
 
-        # 1. Compute estimating equation residual Psi(theta^(t))
+        # 1. Evaluating estimating equation residual Psi(theta^(t))
         Psi = G_TT @ theta_T_old - v_vec[T]
         if len(Tc) > 0:
-            Psi += G[np.ix_(T, Tc)] @ deriv_coef[Tc]
+            Psi = Psi + G[np.ix_(T, Tc)] @ deriv_coef[Tc]
 
-        # 2. Invert Meat matrix B with Tikhonov safeguard
-        B_inv = np.linalg.inv(B)
+        # 2. Continuous regularization of A (prevents binary fallback chattering)
+        A_solve = A.copy()
+        eig_real_min = np.linalg.eigvals(A_solve).real.min()
+        if eig_real_min < self.tol:
+            # Shift spectrum continuously so all eigenvalues have positive real parts
+            shift = (self.tol - eig_real_min) + lm_damping * np.linalg.norm(G_TT, ord=2)
+            A_solve = A_solve + shift * np.eye(dim_T)
 
-        # 3. Assemble symmetric, PSD system matrix S and RHS gradient
-        S = A.T @ B_inv @ A
-        rhs_grad = -A.T @ (B_inv @ Psi)
-        delta_theta = np.linalg.solve(S, rhs_grad)
+        # 3. Solve A_solve @ delta_theta = -Psi
+        try:
+            delta_theta = -np.linalg.solve(A_solve, Psi)
+        except np.linalg.LinAlgError:
+            delta_theta = -np.linalg.lstsq(A_solve, Psi, rcond=self.tol)[0]
 
-        # 6. Successive Over-Relaxation (SOR) update
+        # 4. Trust-region step clipping (prevents jumps across SURE mode switches)
+        theta_scale = max(np.linalg.norm(theta_T_old), 1.0)
+        step_norm = np.linalg.norm(delta_theta)
+        max_step = max_rel_step * theta_scale
+        if step_norm > max_step:
+            delta_theta = delta_theta * (max_step / step_norm)
+
+        # 5. Damped update
         theta_new[T] = theta_T_old + relaxation * delta_theta
         return theta_new
 
@@ -867,7 +902,8 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
 
         coef_vals = self._initial_coef_vals
         self.fit_stats = {}
-        last_iter = False
+        converged = False
+        start_converge = False
         # --- Block Coordinate Descent for Physics Parameters ---
         for iteration in range(self.max_iter):
             penalty_matrix, forcing_vector = self._build_penalty_and_force(coef_vals)
@@ -913,19 +949,20 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
                 self.beta_full_ = beta_I
                 self.Vw = self.V_ * self.ewa_res_['shrink_weight']
 
-            if last_iter:
-                break
-
             gram_matrices, proj_vec, J_phi = self.compute_theta_system_pde(self._omega_dict,
                                                                            self.beta_full_,
                                                                            coef_vals,
-                                                                           sigma=self.sigma_est_,)
+                                                                           sigma=self.sigma_est_,
+                                                                           bias_corrected=self.bias_corrected)
 
-            if not self.bias_corrected:
+            if converged:
+                break
+
+            if not (self.accelerate and start_converge):
                 coef_mean = self.get_coef_dist(gram_matrices, coef_vals, proj_vec)
             else:
                 A, B, _, _, _ = self.compute_asymptotic_variance(coef_vals, self.ewa_res_, self.y_adj_, self.force_proj,
-                                                                                lam_vec=self.lam_grid_, U=self.U_, V=self.V_, s=self.s_)
+                                                                 lam_vec=self.lam_grid_, U=self.U_, V=self.V_, s=self.s_)
                 coef_mean = self.get_coef_dist_corrected(gram_matrices, coef_vals, proj_vec, A, B)
 
             w = self.ewa_res_['weights']
@@ -951,9 +988,11 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
             coef_pct_chg = np.abs(old_theta_T - new_theta_T).sum() / (np.abs(old_theta_T).sum() + 1e-8)
 
             coef_vals = coef_mean
+            if coef_pct_chg < 0.1:
+                start_converge = True
             if coef_pct_chg < self.min_param_pct_chg:
                 logger.info("Physics parameters converged.")
-                last_iter = True
+                converged = True
 
             # old_physics_loss = self.fit_stats.get(iteration - 1, [np.inf])[0]
             # loss_pct_decr = 1 - (physics_loss / old_physics_loss)
@@ -974,15 +1013,16 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
                                                              'w_lq', 'w_mean', 'w_uq']).T.rename_axis('iter')
         return self
 
-    def compute_cov_beta(self, omega_matrix, weights, H_lam, V, r, sig2, n, gamma):
+    def compute_cov_beta(self, omega_matrix, weights, H_lam, H_r, V, sig2, n, gamma):
         E_D = np.diag(omega_matrix @ weights)  # (p, p)
 
-        A_grid = H_lam * r[:, np.newaxis]  # (p, n_lambda)
-        B_grid = (H_lam ** 2) * r[:, np.newaxis]  # (p, n_lambda)
-        B_centered = B_grid - (B_grid @ weights)[:, np.newaxis]  # (p, n_lambda)
-        Cov_w = A_grid @ (B_centered * weights[np.newaxis, :]).T  # (p, p)
+        A_grid = H_r  # (p, n_lambda): d - alpha(lam)
+        B_grid = H_lam * H_r  # (p, n_lambda): (1 - omega) * (d - alpha(lam))
+        B_centered = B_grid - (B_grid @ weights)[:, np.newaxis]
+        Cov_w = A_grid @ (B_centered * weights[np.newaxis, :]).T
 
-        Xi = E_D + (2.0 * n / gamma) * Cov_w  # (p, p)
+        Delta = (2.0 * n / gamma) * Cov_w  # (p, p)
+        Xi = E_D + Delta
 
         has_bc = len(self.boundary_conditions) > 0
         TV = (self.T_matrix_ @ V) if has_bc else V
@@ -1011,6 +1051,8 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
 
         has_bc = len(self.boundary_conditions) > 0
         TV = (self.T_matrix_ @ V) if has_bc else V
+        if sp.issparse(TV):
+            TV = TV.toarray()
         d_vec = self.d_vec_ if has_bc else np.zeros(p)
 
         H_matrices = []
@@ -1037,8 +1079,7 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
     def compute_grad_beta_lambda(
             self,
             H_s: np.ndarray,
-            H_lam: np.ndarray,
-            r: np.ndarray,
+            H_r: np.ndarray,
             J_OLS: np.ndarray,
             H_matrices: list[np.ndarray] | np.ndarray,
     ) -> np.ndarray:
@@ -1053,10 +1094,8 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
         grad_beta : np.ndarray or None
             Ambient candidate spline gradients, shape (p, n_lambda, K).
         """
-        p, n_lam = H_lam.shape
+        p, n_lam = H_r.shape
         K = J_OLS.shape[1]
-
-        H_r = H_lam * r[:, np.newaxis]  # (p, n_lambda)
         grad_alpha = np.zeros((p, n_lam, K))
 
         for k in range(K):
@@ -1068,10 +1107,9 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
     def compute_grad_sure(
             self,
             grad_alpha: np.ndarray,
-            H_lam: np.ndarray,
+            H_r: np.ndarray,
             omega_matrix: np.ndarray,
             H_s: np.ndarray,
-            r: np.ndarray,
             H_matrices: list[np.ndarray] | np.ndarray,
             n: int,
             sig2: float,
@@ -1087,16 +1125,11 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
             SURE gradient matrix, shape (n_lambda, K).
         """
         K = grad_alpha.shape[2]
-        H_r = H_lam * r[:, np.newaxis]  # (p, n_lambda)
+        d_RSS = -2.0 * n * np.sum(H_r[:, :, np.newaxis] * grad_alpha, axis=0)
 
-        # Term 1 & 2: d(RSS) / d(theta_k) via contraction with grad_alpha
-        # -2n * sum_p [ (h * r) * (d alpha / d theta_k) ]
-        d_RSS = -2.0 * n * np.sum(H_r[:, :, np.newaxis] * grad_alpha, axis=0)  # (n_lambda, K)
-
-        # Term 3: Complexity penalty trace term -2 * sig2 * tr(W_df @ H_k)
-        W_df = omega_matrix * H_s  # (p, n_lambda)
-        D_H = np.column_stack([np.diag(H_matrices[k]) for k in range(K)])  # (p, K)
-        d_df = -2.0 * sig2 * (W_df.T @ D_H)  # (n_lambda, K)
+        W_df = omega_matrix * H_s
+        D_H = np.column_stack([np.diag(H_matrices[k]) for k in range(K)])
+        d_df = -2.0 * sig2 * (W_df.T @ D_H)
 
         G_SURE = d_RSS + d_df
         return G_SURE
@@ -1106,36 +1139,13 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
             grad_alpha: np.ndarray,
             G_SURE: np.ndarray,
             weights: np.ndarray,
-            H_lam: np.ndarray,
-            r: np.ndarray,
+            H_r: np.ndarray,
             gamma: float,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Computes the profile EWA spline Jacobian combining direct model
-
-        sensitivity and adaptive SURE model selection:
-
-            J_EWA_spectral = E_w[ d alpha(lambda) / d theta ] - (H*r) @ J_w
-
-        Returns
-        -------
-        J_EWA_spectral : np.ndarray
-            Modal profile Jacobian (d alpha_EWA / d theta_T^T), shape (p, K).
-        J_w : np.ndarray
-            Gibbs weight Jacobian d(w) / d(theta_T)^T, shape (n_lambda, K).
-        J_EWA : np.ndarray or None
-            Ambient profile Jacobian d beta_EWA / d theta_T^T, shape (p, K).
-        """
-        # 1. Weight Jacobian J_w (centered Gibbs derivative)
-        g_bar = weights @ G_SURE  # (K,)
-        J_w = -(1.0 / gamma) * weights[:, np.newaxis] * (G_SURE - g_bar[np.newaxis, :])  # (n_lambda, K)
-
-        # 2. Term 1: Direct sensitivity expectation E_w[ d alpha(lambda) / d theta ]
-        J_direct = np.sum(grad_alpha * weights[np.newaxis, :, np.newaxis], axis=1)  # (p, K)
-
-        # 3. Term 2: Adaptive selection feedback - (H * r) @ J_w
-        H_r = H_lam * r[:, np.newaxis]  # (p, n_lambda)
-        J_adapt = -H_r @ J_w  # (p, K)
-
+    ) -> np.ndarray:
+        g_bar = weights @ G_SURE
+        J_w = -(1.0 / gamma) * weights[:, np.newaxis] * (G_SURE - g_bar[np.newaxis, :])
+        J_direct = np.sum(grad_alpha * weights[np.newaxis, :, np.newaxis], axis=1)
+        J_adapt = -H_r @ J_w
         J_alpha_EWA = J_direct + J_adapt  # (p, K)
         return J_alpha_EWA
 
@@ -1150,10 +1160,6 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
             V: np.ndarray,
             s: np.ndarray,
     ):
-        """
-        cov_beta : np.ndarray
-            Profile spline covariance Cov(beta_EWA), shape (p, p).
-        """
         n = len(y_fit)
         T = self._trainable_idx
         K = len(T)
@@ -1163,55 +1169,46 @@ class EWABSplinePDE(BaseEstimator, RegressorMixin):
         weights = fit_res["weights"]
         shrinkage_matrix = fit_res['shrinkage_matrix']
         alpha_ewa = fit_res['alpha_hat']
-        pos_mask = s > self.tol
         p = len(alpha_ewa)
 
-        # 1. Spectral defect vector r (shape: p)
         d = U.T @ y_fit / n
-        r = d.copy()
-        if force_proj is not None:
-            r[pos_mask] = d[pos_mask] - (force_proj[pos_mask] / s[pos_mask])
+        f_p = np.zeros(p) if force_proj is None else force_proj
 
-        # 2. Spectral shrinkage operators
-        omega_matrix = fit_res["omega_matrix"].copy()
-        omega_matrix[~pos_mask, :] = 1.0
-        H_lam = 1.0 - omega_matrix  # I - D
+        # Exact division-free shrinkage operators valid for all s >= 0 (including s == 0)
+        omega_matrix = fit_res["omega_matrix"]
+        H_lam = 1.0 - omega_matrix
         H_s = lam_vec[np.newaxis, :] * shrinkage_matrix
-        H_s[~pos_mask, :] = 0.0 # TODO!!!!!
+        H_r = H_s * ((s * d - f_p)[:, np.newaxis])
 
-        Xi, cov_beta_sqrt = self.compute_cov_beta(omega_matrix, weights, H_lam, V, r, sig2, n, gamma)
-        J_OLS, H_matrices, force_proj_grad = self.compute_pde_projected_operators(theta, V, d,
-                                                                                  self._omega_dict, self.F_g_dict)
+        Xi, cov_beta_sqrt = self.compute_cov_beta(omega_matrix, weights, H_lam, H_r, V, sig2, n, gamma)
+        J_OLS, H_matrices, force_proj_grad = self.compute_pde_projected_operators(
+            theta, V, d, self._omega_dict, self.F_g_dict
+        )
 
-        grad_alpha = self.compute_grad_beta_lambda(H_s, H_lam, r, J_OLS, H_matrices)
-        G_SURE = self.compute_grad_sure(grad_alpha, H_lam, omega_matrix, H_s, r, H_matrices, n, sig2)
-        J_alpha_EWA = self.compute_grad_beta_ewa(grad_alpha, G_SURE, weights, H_lam, r, gamma)
+        grad_alpha = self.compute_grad_beta_lambda(H_s, H_r, J_OLS, H_matrices)
+        G_SURE = self.compute_grad_sure(grad_alpha, H_r, omega_matrix, H_s, H_matrices, n, sig2)
+        J_alpha_EWA = self.compute_grad_beta_ewa(grad_alpha, G_SURE, weights, H_r, gamma)
 
-        # --- Step 4: Metric Tensor J_TT, K_tilde, and Bread matrix A ---
-        # J_TT (Metric Tensor G_TT)
         has_bc = len(self.boundary_conditions) > 0
         TV = (self.T_matrix_ @ V) if has_bc else V
-        d_vec = self.d_vec_ if has_bc else np.zeros(p)
+        d_vec = self.d_vec_ if has_bc else np.zeros(self.total_n_splines)
         beta = TV @ alpha_ewa + d_vec
 
-        J_TT = np.zeros((K, K))
-        for i, t_i in enumerate(T):
-            for j, t_j in enumerate(T):
-                k_u, k_v = self._coef_keys[t_i], self._coef_keys[t_j]
-                omega_uv = self._omega_dict[(k_u, k_v)]
-                if hasattr(omega_uv, "toarray"):
-                    omega_uv = omega_uv.toarray()
-                omega_uv = np.asarray(omega_uv)
-                J_TT[i, j] = beta.T @ omega_uv @ beta
+        gram_new = self.compute_theta_system_pde(
+                        self._omega_dict,
+                        beta,
+                        theta=theta,
+                        sigma=self.sigma_est_,
+                        bias_corrected=self.bias_corrected)[0]
+        J_TT = gram_new[np.ix_(T, T)]
 
-        # K_tilde (Projected Score Jacobian J_Phi @ V)
         K_tilde = np.zeros((K, p))
         for k in range(K):
             K_tilde[k, :] = H_matrices[k] @ alpha_ewa - force_proj_grad[:, k]
 
-        A = J_TT + K_tilde @ J_alpha_EWA # Extra non-linear term! K_tilde @ J_alpha_EWA!
-        K_Xi = K_tilde @ Xi  # (K, p_red)
-        B = (sig2 / n) * (K_Xi @ K_Xi.T)  # (K, K)
+        A = J_TT + K_tilde @ J_alpha_EWA
+        K_Xi = K_tilde @ Xi
+        B = (sig2 / n) * (K_Xi @ K_Xi.T) #TODO: Unbiased meat matrix
         return A, B, cov_beta_sqrt, K_tilde, J_alpha_EWA
 
     def plot_fit_stats(self, logy=True, **kwargs):
