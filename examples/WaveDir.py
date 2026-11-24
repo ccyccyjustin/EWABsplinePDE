@@ -119,15 +119,7 @@ def setup_config_func(params):
       'force': force_known,
   }
 
-  # Ensure knot density adequately resolves the highest spatio-temporal frequency
-  max_freq = max(
-      params['p_m2'] * np.pi / params['p_L'],
-      params['p_c'] * params['p_m2'] * np.pi / params['p_H'],
-  )
-  required_knots_per_dim = int(max(30, (max_freq / np.pi) * 8))
-  num_int_knots = required_knots_per_dim**DIM
-
-  return domain, PDE_KWARGS, true_params, num_int_knots
+  return domain, PDE_KWARGS, true_params
 
 
 if __name__ == '__main__':

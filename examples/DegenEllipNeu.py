@@ -146,8 +146,7 @@ def setup_config_func(params):
   true_params = {'x,x': 1.0, 'x,y': params['p_b'], 'y,y': params['p_c']}
 
   # Knot allocation resolving highest spatial frequency
-  num_int_knots = 1000
-  return DOMAIN, PDE_KWARGS, true_params, num_int_knots
+  return DOMAIN, PDE_KWARGS, true_params
 
 
 if __name__ == '__main__':

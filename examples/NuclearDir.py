@@ -169,8 +169,7 @@ def setup_config_func(params):
         'core_fission': params['p_cf']
     }
 
-    num_int_knots = 400
-    return domain, pde_kwargs, true_params, num_int_knots
+    return domain, pde_kwargs, true_params
 
 
 # -----------------------------------------------------------------------------

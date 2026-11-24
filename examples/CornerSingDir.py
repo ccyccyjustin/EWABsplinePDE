@@ -113,8 +113,7 @@ def setup_config_func(params):
   true_params = {'': 0.0, 'x,x': 1.0, 'y,y': 1.0}
 
   # Allocate higher resolution near domain bounds
-  num_int_knots = 1000
-  return DOMAIN, PDE_KWARGS, true_params, num_int_knots
+  return DOMAIN, PDE_KWARGS, true_params
 
 
 if __name__ == '__main__':

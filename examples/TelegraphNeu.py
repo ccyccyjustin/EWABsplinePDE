@@ -106,8 +106,7 @@ def setup_config_func(params):
     }
 
     true_params = {'x,x': -params['p_c'] ** 2, 'y,y': 1.0, 'y': gamma_coeff}
-    num_int_knots = 1000
-    return domain, PDE_KWARGS, true_params, num_int_knots
+    return domain, PDE_KWARGS, true_params
 
 
 

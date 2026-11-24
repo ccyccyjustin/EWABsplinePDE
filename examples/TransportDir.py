@@ -110,10 +110,7 @@ def setup_config_func(params):
 
   true_params = {'x': 1.0, 'y': params['p_cy'], 'x,x': 0.0}
 
-  required_knots_per_dim = int(max(30, params['p_m2'] * 15))
-  num_int_knots = required_knots_per_dim**DIM
-
-  return DOMAIN, PDE_KWARGS, true_params, num_int_knots
+  return DOMAIN, PDE_KWARGS, true_params
 
 
 if __name__ == '__main__':

@@ -123,8 +123,7 @@ def setup_config_func(params):
       'force': force_known,
   }
 
-  num_int_knots = 1000
-  return domain, PDE_KWARGS, true_params, num_int_knots
+  return domain, PDE_KWARGS, true_params
 
 
 if __name__ == '__main__':

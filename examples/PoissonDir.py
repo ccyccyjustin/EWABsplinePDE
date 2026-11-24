@@ -82,8 +82,7 @@ def setup_config_func(params):
     }
 
     true_params = {'x,x': 1.0, 'y,y': params['p_a'] ** 2}
-    num_int_knots = 500
-    return domain, PDE_KWARGS, true_params, num_int_knots
+    return domain, PDE_KWARGS, true_params
 
 if __name__ == '__main__':
     # Dispatches the physics definitions to the general testing suite

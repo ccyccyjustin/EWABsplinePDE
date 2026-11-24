@@ -339,7 +339,7 @@ def plot_diagnostics(model, x_test, y_test, e_test, true_params, pde_name):
     ax3.set_xlabel(r"Predictive Standard Error ($\mathrm{se\_mean}$)", fontweight='bold')
     ax3.set_ylabel(r"Raw Empirical Error ($u - \hat{u}$)", fontweight='bold')
     ax3.set_title("3. Conditional Error Funnel", fontweight='bold')
-    ax3.set_xlim(0, se_mean.max() * 1.05)
+    # ax3.set_xlim(0, se_mean.max() * 1.05)
     ax3.grid(True, ls='--', alpha=0.5)
     ax3.legend(loc="upper left", frameon=True)
 
@@ -646,7 +646,8 @@ def plot_res_summary(
             patch_artist=True,
             boxprops=dict(facecolor=group_colors[g_idx], alpha=0.75, edgecolor="black", linewidth=0.9),
             medianprops=dict(color="darkred" if g_idx == 0 else "black", linewidth=1.6),
-            flierprops=dict(marker="o", markersize=3, alpha=0.4)
+            #flierprops=dict(marker="o", markersize=3, alpha=0.4),
+            showfliers=False
         )
 
         for i, data in enumerate(sob_vals):
@@ -670,7 +671,7 @@ def plot_res_summary(
     ax1.set_xticks(x)
     ax1.set_xticklabels([lbl for _, lbl in sob_items], fontsize=10)
     ax1.set_ylabel("Relative Error (%)", fontweight="bold")
-    ax1.set_ylim(0, max(all_max_sob * 1.3, 0.5))
+    # ax1.set_ylim(0, max(all_max_sob * 1.3, 0.5))
     ax1.yaxis.set_major_formatter(mtick.PercentFormatter())
     ax1.set_title("A. Sobolev Relative Error Hierarchy ($L^2, H^1, H^2$)", fontweight="bold")
     ax1.grid(axis="y", linestyle="--", alpha=0.5)
@@ -707,7 +708,8 @@ def plot_res_summary(
             patch_artist=True,
             boxprops=dict(facecolor=group_colors[g_idx], alpha=0.75, edgecolor="black", linewidth=0.9),
             medianprops=dict(color="darkred" if g_idx == 0 else "black", linewidth=1.6),
-            flierprops=dict(marker="o", markersize=3, alpha=0.4)
+            # flierprops=dict(marker="o", markersize=3, alpha=0.4),
+            showfliers=False
         )
 
         for i, data in enumerate(sp_vals):
@@ -730,7 +732,7 @@ def plot_res_summary(
 
     ax2.set_yticks(y_pos)
     ax2.set_yticklabels([lbl for _, lbl in sp_items], fontsize=9)
-    ax2.set_xlim(0, all_max_sp * 1.3)
+    # ax2.set_xlim(0, all_max_sp * 1.3)
     ax2.set_xlabel("Magnitude (Field Units)", fontweight="bold")
     ax2.set_title("B. Spatial Error Decomposition & Interval Sharpness", fontweight="bold")
     ax2.grid(axis="x", linestyle="--", alpha=0.5)
@@ -764,7 +766,8 @@ def plot_res_summary(
             patch_artist=True,
             boxprops=dict(facecolor=group_colors[g_idx], alpha=0.75, edgecolor="black", linewidth=0.9),
             medianprops=dict(color="black", linewidth=1.6),
-            flierprops=dict(marker="o", markersize=3, alpha=0.4)
+            # flierprops=dict(marker="o", markersize=3, alpha=0.4),
+            showfliers=False
         )
 
         for i, data in enumerate(emp):
@@ -787,7 +790,7 @@ def plot_res_summary(
 
     ax3.set_xticks(xc)
     ax3.set_xticklabels(["90% CI", "95% CI", "99% CI"], fontsize=10)
-    ax3.set_ylim(max(0.0, min(50.0, min_emp - 5)), 105.0)
+    # ax3.set_ylim(max(0.0, min(50.0, min_emp - 5)), 105.0)
     ax3.yaxis.set_major_formatter(mtick.PercentFormatter())
     ax3.set_ylabel("Coverage Probability (%)", fontweight="bold")
     ax3.set_title("C. Uncertainty Interval Calibration ($90\\%, 95\\%, 99\\%$)", fontweight="bold")
@@ -939,7 +942,8 @@ def plot_res_summary(
                 linewidth=0.9,
             ),
             medianprops=dict(color="black", linewidth=1.6),
-            flierprops=dict(marker="o", markersize=3, alpha=0.4),
+            # flierprops=dict(marker="o", markersize=3, alpha=0.4),
+            showfliers=False
         )
 
     # 4. Annotate coverage probability and median z-score per parameter
@@ -1004,9 +1008,9 @@ def plot_res_summary(
     ax4.grid(axis="x", ls="--", alpha=0.5)
 
     # Set x-limits with room for the annotation badges
-    x_lim_left = min(global_min_z * 1.15, -3.2)
-    x_lim_right = max(global_max_z * 1.25, 5.5)
-    ax4.set_xlim(x_lim_left, x_lim_right)
+    # x_lim_left = min(global_min_z * 1.15, -3.2)
+    # x_lim_right = max(global_max_z * 1.25, 5.5)
+    # ax4.set_xlim(x_lim_left, x_lim_right)
 
     d_proxies = [
         plt.Line2D(
@@ -1054,6 +1058,7 @@ def run_pde_experiment(
     parser = argparse.ArgumentParser(description=f"Run {dim}D {pde_name} PDE")
     parser.add_argument("-n", "--sample_size", type=int, default=1000)
     parser.add_argument("-sf", "--sigma_frac", type=float, default=0.1, help="Noise to Signal Ratio")
+    parser.add_argument("-deg", "--degree", type=int, default=3)
     parser.add_argument("-a", "--alpha", type=float, default=.05)
     parser.add_argument("-q", "--quantile", type=str, default='0')
     parser.add_argument("-i", "--iteration", type=int, default=100)
@@ -1071,6 +1076,7 @@ def run_pde_experiment(
 
     n = args.sample_size
     sigma_frac = args.sigma_frac
+    deg = args.degree
     alpha = args.alpha
     n_iter = args.iteration
 
@@ -1087,7 +1093,7 @@ def run_pde_experiment(
     params = {p_name: getattr(args, p_dict['flag']) for p_name, p_dict in pde_params.items()}
 
     # Calculate required knots and metadata specific to this PDE
-    domain, pde_kwargs, true_params, num_int_knots = setup_config_func(params)
+    domain, pde_kwargs, true_params = setup_config_func(params)
     if any(['operator' in k.lower() for k in pde_kwargs.keys()]):
         MOD = FunctionalEWABSplinePDE
         weak_form = True  # TODO?
@@ -1130,7 +1136,7 @@ def run_pde_experiment(
 
         # print(f"True Sigma: {sigma_scaled}")
         model = MOD(dim=dim, variables=variables, domain=domain, boundary_conditions=bc_dict,
-                              alpha=alpha, quantile_based=quantile_based, num_int_knots=num_int_knots,
+                              alpha=alpha, quantile_based=quantile_based, deg=deg, #num_int_knots=num_int_knots,
                               total_grid_size=10000, weak_form=weak_form, bias_corrected=bias_corrected,
                               **pde_kwargs)
         model.fit(x_train, y_train)
@@ -1165,19 +1171,14 @@ def run_pde_experiment(
             model.plot_derivatives(deriv_orders_list=[(0, 0), (1, 0), (0, 1), (2, 0), (1, 1), (0, 2)],
                                    true_deriv_func=true_sol_with_derivatives,
                                    true_deriv_kwargs=params)
+            model.plot_lambda_weight()
+            model.plot_eigenvalues()
+            model.plot_basis_functions()
 
-            # 1. Build the aligned parameter summary table
-            param_df = align_pde_params(true_params, model=model)
-            print("\n=== Aligned PDE Parameter Discovery Summary ===")
-            print(param_df.to_string(index=False, float_format=lambda x: f"{x:.4e}"))
-
-            plot_diagnostics(model, x_test, y_test, e_test, true_params, pde_name)
+            # plot_diagnostics(model, x_test, y_test, e_test, true_params, pde_name)
             # model.plot_fit_stats()
             # model.galerkin_force_diagnostics()
             # model.galerkin_penalty_diagnostics()
-
-            trainable_true_vals = param_df.iloc[model._trainable_idx]['True_Value'].values
-            model.plot_coef_dist(true_vals=trainable_true_vals)
 
             # Plot True Solution (If 2D)
             # if debug and (dim == 2):
@@ -1191,13 +1192,19 @@ def run_pde_experiment(
             #     title_str = f"True Solution for {pde_name} + {true_params}"
             #     ax.set(title=title_str, xlabel=variables[0], ylabel=variables[1])
             #     plt.show()
-
             # Plot Fitted
-            #model.plot_fit(x_test=x_test, y_test=y_test)
-            model.plot_lambda_weight()
-            model.plot_eigenvalues()
-            model.plot_basis_functions()
+            # model.plot_fit(x_test=x_test, y_test=y_test)
 
+        # 1. Build the aligned parameter summary table
+        # param_df = align_pde_params(true_params, model=model)
+        # # print("\n=== Aligned PDE Parameter Discovery Summary ===")
+        # # print(param_df.to_string(index=False, float_format=lambda x: f"{x:.4e}"))
+        #
+        # trainable_true_vals = param_df.iloc[model._trainable_idx]['True_Value'].values
+        # # model.plot_coef_dist(true_vals=trainable_true_vals)
+        #
+        # t = (model.coef_mean[model._trainable_idx] - trainable_true_vals) / np.sqrt(np.diag(model.coef_var))
+        # print(model.coef_mean[model._trainable_idx], t)
         return res_series
 
     t0 = time.time()

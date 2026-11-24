@@ -95,9 +95,7 @@ def setup_config_func(params):
 
   true_params = {'x,x': 1.0, 'y,y': 1.0, 'x': 0.0}
 
-  num_int_knots = 1000 #required_knots_per_dim**DIM
-
-  return DOMAIN, PDE_KWARGS, true_params, num_int_knots
+  return DOMAIN, PDE_KWARGS, true_params
 
 
 if __name__ == '__main__':
