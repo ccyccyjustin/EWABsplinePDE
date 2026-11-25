@@ -30,7 +30,7 @@ Let $`V_h = \bigotimes_{r=1}^d V_{h,r} = \mathrm{span}\{\Phi_1, \dots, \Phi_M\}`
 
 ### 2. Spectral Orthogonalization & SURE-Weighted EWA
 
-Given the current PDE penalty $`P(\theta) = \sum_{a,b} \theta_a \theta_b \Omega_{ab}`$, and empirical Gram matrix $$\qquad G_n = \frac{1}{n} B^T B$$, the solver diagonalizes the pair $`(P(\theta), G_n)`$:
+Given the current PDE penalty $`P(\theta) = \sum_{a,b} \theta_a \theta_b \Omega_{ab}`$, and empirical Gram matrix $$G_n = \frac{1}{n} B^T B$$, the solver diagonalizes the pair $`(P(\theta), G_n)`$:
 
 $$P(\theta) V = G_n V S, \qquad V^T G_n V = I_{n_I}, \qquad S = \mathrm{diag}(s_1, \dots, s_{n_I}).$$
 
@@ -38,17 +38,17 @@ In the orthonormal basis $`U = B_{\text{red}} V`$ with empirical projection $`d 
 
 $$\hat{\alpha}_j(\lambda_m) = \omega_{jm} d_j + h_{jm} f_j, \qquad \omega_{jm} = \frac{(1-\lambda_m)n}{(1-\lambda_m)n + \lambda_m s_j}, \qquad h_{jm} = \frac{\lambda_m}{(1-\lambda_m)n + \lambda_m s_j}.$$
 
-Using the exact spectral SURE risk $`\mathrm{SURE}(\lambda_m) = \lVert y_\perp \rVert_2^2 + n \sum_j [h_{jm}(s_j d_j - f_j)]^2 + 2\hat{\sigma}^2 \sum_j \omega_{jm}`$ and temperature $`\gamma = \gamma_{\text{mult}} \hat{\sigma}^2`$, EWA aggregates all candidates via Gibbs weights:
+Using the SURE risk $`\mathrm{SURE}(\lambda_m)`$ and temperature $`\gamma`$, EWA aggregates all candidates via Gibbs weights:
 
-$$w_m = \frac{\pi_m \exp(-\mathrm{SURE}(\lambda_m)/\gamma)}{\sum_\ell \pi_\ell \exp(-\mathrm{SURE}(\lambda_\ell)/\gamma)}, \qquad \hat{\alpha}_{\text{EWA}} = \sum_{m=1}^L w_m \hat{\alpha}(\lambda_m), \qquad \hat{\beta}_{\text{full}} = T V \hat{\alpha}_{\text{EWA}} + d_0.$$
+$$w_m = \frac{\pi_m \exp(-\mathrm{SURE}(\lambda_m)/\gamma)}{\sum_\ell \pi_\ell \exp(-\mathrm{SURE}(\lambda_\ell)/\gamma)}, \qquad \hat{\alpha}_{\text{EWA}} = \sum_{m=1}^L w_m \hat{\alpha}(\lambda_m), \qquad \hat{\beta} = V \hat{\alpha}_{\text{EWA}}.$$
 
 ### 3. Parameter Estimation & Asymptotic Variance
 
 Alternating with the EWA surface update, $`\theta_T`$ solves the linear PDE normal equations $`\Psi(\theta, \hat{\beta}) = G_{TT}\theta_T + G_{TT^c}\theta_{T^c} - v_T = 0`$. Differentiating both the linear filter and the data-dependent SURE weights yields:
-- **Adaptive modal sensitivity:** $`\Xi = \frac{\partial \hat{\alpha}_{\text{EWA}}}{\partial d} = \mathrm{diag}(\bar{\omega}) + \frac{2n}{\gamma} H_r \mathrm{diag}(w) B_{\text{centered}}^T`$, giving predictive field covariance $`\widehat{\mathrm{Cov}}(\hat{\beta}_{\text{full}}) = \frac{\hat{\sigma}^2}{n}(TV\Xi)(TV\Xi)^T`$.
+- **Adaptive modal sensitivity:** $`\Xi = \frac{\partial \hat{\alpha}_{\text{EWA}}}{\partial d}`$, giving predictive field covariance $`\widehat{\mathrm{Cov}}(\hat{\beta}) = \frac{\hat{\sigma}^2}{n}(V\Xi)(V\Xi)^T`$.
 - **Coupled parameter Jacobian (Bread) and Score Covariance (Meat):** Propagating $`\theta`$-perturbations through the candidate path, SURE gradient $`G_{\text{SURE}}`$, and EWA weights yields $`J_{\alpha,\text{EWA}} = V^{-1}\partial_{\theta_T} \hat{\beta}_{I,\text{EWA}}`$, giving
 
-$$A = J_{TT} + K J_{\alpha,\text{EWA}}, \qquad B = \frac{\hat{\sigma}^2}{n}(K \Xi)(K \Xi)^T, \qquad \widehat{\mathrm{Cov}}(\hat{\theta}_T) = A^{-1} B A^{-T},$$
+$$A = G_{TT} + K J_{\alpha,\text{EWA}}, \qquad B = \frac{\hat{\sigma}^2}{n}(K \Xi)(K \Xi)^T, \qquad \widehat{\mathrm{Cov}}(\hat{\theta}_T) = A^{-1} B A^{-T},$$
 
 where $`K`$ is the modal gradient of the PDE score $`\Psi`$.
 
