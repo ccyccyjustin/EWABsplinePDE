@@ -34,7 +34,7 @@ Given the current PDE penalty $`P(\theta) = \sum_{a,b} \theta_a \theta_b \Omega_
 
 $$P(\theta) V = G_n V S, \qquad V^T G_n V = I_{n_I}, \qquad S = \mathrm{diag}(s_1, \dots, s_{n_I}).$$
 
-In the orthonormal basis $`U = B_{\text{red}} V`$ with empirical projection $`d = \frac{1}{n} U^T y_`$ and projected forcing $`f = V^T v`$, every penalized candidate along the $`\lambda_m \in (0, 1)`$ grid has a diagonal closed form:
+In the orthonormal basis $`U = B_{\text{red}} V`$ with empirical projection $`d = \frac{1}{n} U^T y`$ and projected forcing $`f = V^T v`$, every penalized candidate along the $`\lambda_m \in (0, 1)`$ grid has a diagonal closed form:
 
 $$\hat{\alpha}_j(\lambda_m) = \omega_{jm} d_j + h_{jm} f_j, \qquad \omega_{jm} = \frac{(1-\lambda_m)n}{(1-\lambda_m)n + \lambda_m s_j}, \qquad h_{jm} = \frac{\lambda_m}{(1-\lambda_m)n + \lambda_m s_j}.$$
 
@@ -51,6 +51,7 @@ Alternating with the EWA surface update, $`\theta_T`$ solves the linear PDE norm
 $$A = J_{TT} + K J_{\alpha,\text{EWA}}, \qquad B = \frac{\hat{\sigma}^2}{n}(K \Xi)(K \Xi)^T, \qquad \widehat{\mathrm{Cov}}(\hat{\theta}_T) = A^{-1} B A^{-T},$$
 
 where $`K`$ is the modal gradient of the PDE score $`\Psi`$.
+
 ---
 
 ## Repository Structure
