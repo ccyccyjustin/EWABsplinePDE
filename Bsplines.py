@@ -10,6 +10,7 @@ def create_knots(int_knots, boundary_knots, degree=3):
     assert (np.diff(t) >= 0).all()
     return t
 
+
 def create_spline_basis(all_knots, degree):
     """
     Creates a continuous BSpline object representing the entire basis space.
@@ -37,6 +38,28 @@ def bs(x, spl_obj, intercept=True):
     if not intercept:
         basis_matrix = basis_matrix[:, 1:]
     return basis_matrix
+
+
+def tensor_prod(*vectors):
+    n = len(vectors)
+    lengths = [len(v) for v in vectors]
+    dtype = np.result_type(*vectors)
+
+    # 1. Allocate a single contiguous block of memory of shape (L1, L2, ..., Ln, n)
+    out = np.empty((*lengths, n), dtype=dtype)
+
+    # 2. Dynamically reshape each vector into a 1D slice along its specific axis
+    for i, v in enumerate(vectors):
+        # Create a shape tuple filled with 1s: [1, 1, ..., 1]
+        broadcast_shape = [1] * n
+        # Inject the vector's true length into its designated axis
+        broadcast_shape[i] = lengths[i]
+
+        # Pass the reshaped vector to out[..., i] to let C-level loops handle broadcasting
+        out[..., i] = v.reshape(broadcast_shape)
+
+    # 3. Flatten the spatial axes into a single axis, leaving the last dimension intact
+    return out.reshape(-1, n)
 
 
 def build_custom_tensor_basis(X, spline_objs:list, dim, active_dims):

@@ -1,9 +1,5 @@
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
-from matplotlib.colors import Normalize
-from matplotlib.cm import ScalarMappable
 
 from joblib import Parallel, delayed
 from tqdm import tqdm
@@ -24,8 +20,6 @@ import logging
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
-CMAP = sns.diverging_palette(20, 220, as_cmap=True)
-
 
 def parallel(func, iterable, n_jobs=-1, disable_par=False, **kwargs):
     def _worker_task(func, *args, **kwargs):
@@ -44,21 +38,18 @@ def parallel(func, iterable, n_jobs=-1, disable_par=False, **kwargs):
     return results
 
 
-def orthogonalize_basis_fast(G_perturb, omega):
+def orthogonalize_basis(G, omega):
     """
     Lets LAPACK handle the GEVP using the precomputed G matrix.
-    This entirely avoids Python-level dense matrix multiplication overhead.
     """
 
     # 1. Solve GEVP directly (LAPACK's dsygvd handles Cholesky and symmetry in C/Fortran)
     if sp.issparse(omega):
         omega = omega.toarray()
-    if sp.issparse(G_perturb):
-        G_perturb = G_perturb.toarray()
+    if sp.issparse(G):
+        G = G.toarray()
 
-    s_raw, V = eigh(omega, G_perturb)
-    # sum_s = np.trace(np.linalg.solve(G_perturb, omega))
-    # print(f'Eigvals explained: {s_raw.sum() / sum_s}')
+    s_raw, V = eigh(omega, G)
 
     idx2 = np.argsort(s_raw)
     s_raw = s_raw[idx2]
@@ -78,61 +69,9 @@ def compute_smallest_eigenvectors(penalty_matrix, gram, k, sigma=-1e-4, tol=1e-9
     return evals, evecs
 
 
-def compute_smallest_eigenvectors_cg(penalty_matrix, gram, k):
-    N = penalty_matrix.shape[0]
-
-    from scipy.sparse.linalg import spilu, LinearOperator, lobpcg
-    # 1. Provide an Incomplete LU / Cholesky Preconditioner
-    # An ILU with drop_tol=1e-3 computes in ~0.05s and cuts condition number by 1000x
-    ilu = spilu((penalty_matrix + 1.0 * gram), drop_tol=1e-3)
-    M_precond = LinearOperator((N, N), matvec=lambda x: ilu.solve(x))
-
-    # 2. Smooth Initialization (CRITICAL)
-    # Generate random vectors, but smooth them through the preconditioner once
-    rng = np.random.default_rng(42)
-    X_raw = rng.standard_normal((N, k))
-    X_smooth = ilu.solve(X_raw) # Filters out knot-scale noise instantly
-
-    # 3. Run LOBPCG with preconditioner and higher iteration ceiling
-    evals, evecs = lobpcg(
-        A=penalty_matrix,
-        X=X_smooth,
-        B=gram,
-        M=M_precond, # Preconditioner makes CG steps effective
-        largest=False,
-        tol=1e-4,
-        maxiter=400
-    )
-    # eigenfunctions = scipy.linalg.eigh(penalty_matrix, self.gram)
-    idx = np.argsort(evals)
-    evals = evals[idx]
-    evecs = evecs[:, idx]
-    return evals, evecs
-
-
-def gsj_est(y):
-
+def gsj_est(X, y):
     """
-    TODO!!!!!
-    Gasser-Sroka-Jennrich (GSJ) Noise Variance Estimator.
-    Computes a differencing estimator for sigma^2.
-    """
-    y = np.asarray(y)
-    n = len(y)
-    # GSJ coefficients for a 3-point window
-    # c = [0.4745, -0.9489, 0.4745] (approx)
-    # Formally: c_i are weights that minimize variance while annihilating linear trends
-    c = np.array([1 / np.sqrt(6), -2 / np.sqrt(6), 1 / np.sqrt(6)])
-
-    # Convolve to get differences
-    res = np.convolve(y, c, mode='valid')
-    sigma_sq = np.sum(res ** 2) / (n - 2)
-    return np.sqrt(sigma_sq)
-
-
-def gsj_est_2d_scattered(X, y):
-    """
-    Nearest-neighbor variance estimator for unstructured 2D/3D data.
+    Gasser-Sroka-Jennrich (GSJ) Noise Variance Estimator for unstructured 2D/3D data.
     X: array of shape (N, 2)
     y: array of shape (N,)
     """
@@ -223,7 +162,8 @@ def fit_ewa_helper(y_fit, force_proj, U, V, s,
     assert np.all(s[:-1] <= s[1:])
 
     if force_proj is not None:
-        num = (1.0 - lam_vec)[np.newaxis, :] * (n * d[:, np.newaxis]) + lam_vec[np.newaxis, :] * force_proj[:, np.newaxis]
+        num = ((1.0 - lam_vec)[np.newaxis, :] * (n * d[:, np.newaxis])
+               + lam_vec[np.newaxis, :] * force_proj[:, np.newaxis])
     else:
         num = (1.0 - lam_vec)[np.newaxis, :] * (n * d[:, np.newaxis])
 
@@ -320,227 +260,6 @@ def gaussian_crps(y_true: np.ndarray, mu: np.ndarray, sigma: np.ndarray) -> floa
     return float(np.mean(crps))
 
 
-def mvn_pairplot(mu, sigma, true_vals=None, title='MVN Density Pairplot',
-                 labels=None, num_grid_points=100, one_figsize=2.2, **kwargs):
-    """
-    Generates a lower-triangular corner pair plot displaying the EXACT
-    analytical probability density functions of a Multivariate Normal
-    distribution of any dimension (no simulations or random samples used).
-
-    Parameters:
-    -----------
-    mu : array-like
-        The mean vector of length D.
-    sigma : array-like
-        The D x D covariance matrix.
-    labels : list of str, optional
-        Names for the parameters. Defaults to ['$X_0$', '$X_1$', ...]
-    num_grid_points : int
-        Resolution of the analytical grid evaluation (default 100).
-    """
-    mu = np.asarray(mu)
-    sigma = np.asarray(sigma)
-    dim = len(mu)
-    if true_vals is not None:
-        assert len(true_vals) == dim
-        assert np.isfinite(true_vals).all()
-
-    if sigma.shape != (dim, dim):
-        raise ValueError("Covariance matrix shape must match mean vector length.")
-
-    if labels is None:
-        labels = [f'$X_{i}$' for i in range(dim)]
-
-    # 1. Determine the analytical evaluation limits for each axis
-    # We span +/- 3.5 standard deviations around each parameter's mean
-    stdevs = np.sqrt(np.diagonal(sigma))
-    mins = mu - 3.5 * stdevs
-    maxs = mu + 3.5 * stdevs
-    if true_vals is not None:
-        true_vals = np.asarray(true_vals, dtype=float).ravel()
-        mins = np.minimum(mins, true_vals - 1.5 * stdevs)
-        maxs = np.maximum(maxs, true_vals + 1.5 * stdevs)
-
-    # 2. Set up the plotting grid matrix
-    fig, axes = plt.subplots(dim, dim, figsize=(one_figsize * dim, one_figsize * dim), squeeze=False)
-
-    for i in range(dim):
-        for j in range(dim):
-            ax = axes[i, j]
-
-            # --- Case A: Upper Triangle (Unused) ---
-            if j > i:
-                ax.axis('off')
-                continue
-
-            # --- Case B: Diagonal (Exact Univariate Marginal PDF) ---
-            if i == j:
-                x_eval = np.linspace(mins[i], maxs[i], num_grid_points * 2)
-                pdf_eval = norm.pdf(x_eval, loc=mu[i], scale=stdevs[i])
-                ax.plot(x_eval, pdf_eval, color='midnightblue', linewidth=2)
-                ax.fill_between(x_eval, pdf_eval, color='midnightblue', alpha=0.3)
-                ax.axvline(mu[i], color='darkorange', ls='--', lw=1.5, label='Estimate')
-                if true_vals is not None:
-                    ax.axvline(true_vals[i], color='crimson', ls='-', lw=1.8, label='True $\\theta^*$')
-
-                ax.set_xlim(mins[i], maxs[i])
-                ax.get_yaxis().set_visible(False)
-                ax.grid(True, linestyle=':', alpha=0.5)
-
-            # --- Case C: Lower Off-Diagonal (Exact Bivariate Marginal PDF) ---
-            else:
-                # Generate 2D evaluation grid
-                x_eval = np.linspace(mins[j], maxs[j], num_grid_points)
-                y_eval = np.linspace(mins[i], maxs[i], num_grid_points)
-                X, Y = np.meshgrid(x_eval, y_eval)
-                pos = np.dstack((X, Y))
-
-                # Extract exact sub-mean and sub-covariance matrix analytically
-                mu_sub = np.array([mu[j], mu[i]])
-                sigma_sub = np.array([
-                    [sigma[j, j], sigma[j, i]],
-                    [sigma[i, j], sigma[i, i]]
-                ])
-
-                # Exact analytical 2D Gaussian density calculation
-                mvn_sub = multivariate_normal(mean=mu_sub, cov=sigma_sub, allow_singular=True)
-                Z = mvn_sub.pdf(pos)
-
-                # Plot the smooth exact continuous density contours
-                ax.contourf(X, Y, Z, levels=10, cmap='Blues', alpha=0.85)
-                ax.contour(X, Y, Z, levels=5, colors='midnightblue', linewidths=0.5, alpha=0.5)
-                ax.scatter(mu[j], mu[i], color='crimson', marker='x', s=40, zorder=5)
-                if true_vals is not None:
-                    ax.scatter(true_vals[j], true_vals[i], color='crimson', marker='x', s=50, zorder=6)
-
-                # Force alignment across columns and rows
-                ax.set_xlim(mins[j], maxs[j])
-                ax.set_ylim(mins[i], maxs[i])
-                ax.grid(True, linestyle=':', alpha=0.5)
-
-            # --- Label and Tick Cleanliness Management ---
-            # Explicitly set outer labels
-            if i == dim - 1:
-                ax.set_xlabel(labels[j], fontsize=11, labelpad=10)
-            if j == 0 and i > 0:
-                ax.set_ylabel(labels[i], fontsize=11, labelpad=10)
-            if i != dim - 1:
-                ax.tick_params(labelbottom=False)
-            if j != 0:
-                ax.tick_params(labelleft=False)
-
-    plt.suptitle(title, y=0.99, fontsize=13, fontweight='bold', color='midnightblue')
-    plt.tight_layout()
-    return fig, axes
-
-def tensor_prod(*vectors):
-    n = len(vectors)
-    lengths = [len(v) for v in vectors]
-    dtype = np.result_type(*vectors)
-
-    # 1. Allocate a single contiguous block of memory of shape (L1, L2, ..., Ln, n)
-    out = np.empty((*lengths, n), dtype=dtype)
-
-    # 2. Dynamically reshape each vector into a 1D slice along its specific axis
-    for i, v in enumerate(vectors):
-        # Create a shape tuple filled with 1s: [1, 1, ..., 1]
-        broadcast_shape = [1] * n
-        # Inject the vector's true length into its designated axis
-        broadcast_shape[i] = lengths[i]
-
-        # Pass the reshaped vector to out[..., i] to let C-level loops handle broadcasting
-        out[..., i] = v.reshape(broadcast_shape)
-
-    # 3. Flatten the spatial axes into a single axis, leaving the last dimension intact
-    return out.reshape(-1, n)
-
-
-def contour_plot(X, Y, Z, fig=None, ax=None, vmin=None, vmax=None, cbar=True, **kwargs):
-    # 3. Plot the 2D Z array directly
-    # Note: x and y tick labels can be specified using xticklabels and yticklabels
-    Z_plot = np.ma.masked_invalid(Z)
-    if ax is None:
-        fig, ax = plt.subplots(figsize=(6, 5))
-    norm = Normalize(vmin=vmin, vmax=vmax)
-    ax.contourf(X, Y, Z_plot, cmap=CMAP, norm=norm)
-    if cbar:
-        sm = map_color(vmin, vmax)
-        fig.colorbar(sm, ax=ax)
-    return fig, ax
-
-def norm_color(vmin, vmax):
-    return Normalize(vmin=vmin, vmax=vmax)
-
-def map_color(vmin, vmax):
-    norm = norm_color(vmin=vmin, vmax=vmax)
-    return ScalarMappable(norm, cmap=CMAP)
-
-
-def tensor_diagnostics(F_tensor, tol=1e-12):
-    """
-    Computes statistics for every conditional slice of an N-dimensional tensor.
-    For a shape (3,5,7,9), this computes exactly 24 sets of statistics.
-    """
-    ndim = F_tensor.ndim
-    shape = F_tensor.shape
-
-    # Store the 24 statistics in a dictionary mapped by (Axis, Index)
-    tstats = {}
-
-    for axis in range(ndim):
-        axis_length = shape[axis]
-        for index in range(axis_length):
-
-            sub_tensor = np.take(F_tensor, indices=index, axis=axis)
-
-            # 2. Compute the requested statistics on this specific slice
-            # L2 Norm (Energy of the cross-section)
-            energy = np.linalg.norm(sub_tensor)
-            max_amp = np.max(np.abs(sub_tensor))
-            sparsity = np.sum(np.abs(sub_tensor) < tol) / sub_tensor.size
-
-            # Store it
-            tstats[(axis, index)] = {
-                'energy': energy,
-                'max_amp': max_amp,
-                'sparsity': sparsity
-            }
-        # 3. Axis-level diagnostics
-        # energy_variance = np.var(axis_energies) / (np.mean(axis_energies) ** 2 + 1e-16)
-        # print(f"  -> Energy Coefficient of Variation across Dim {axis}: {energy_variance:.4f}")
-    tstats = pd.DataFrame(tstats).T.rename_axis(['dim', 'idx'])
-    return tstats
-
-def format_latex_name(op_key, axis_names = ['x', 'y', 'z', 'w']):
-    """
-    Translates the raw operator tuples directly into a LaTeX math string.
-    Example: ((0, 0, 2), (1, 2), (0, 1, 1, 1, 2)) -> "$u_{xxz} u_{yz} u_{xyyyz}$"
-    """
-
-    # Fallback for string names (e.g., 'u_xx')
-    assert isinstance(op_key, (list, tuple))
-    # Handle the base case 'u' (empty tuple)
-    if len(op_key) == 0:
-        return "$u$"
-
-    # Wrap an isolated factor like (0,0,2) into ((0,0,2),) to standardize the loop
-
-    if isinstance(op_key[0], int):
-        op_key = (op_key,)
-
-    terms = []
-    for term_axes in op_key:
-        if len(term_axes) == 0:
-            terms.append("u")
-        else:
-            # Direct 1-to-1 mapping of the integer to the axis letter
-            assert all(i < len(axis_names) for i in term_axes), "Axis index exceeds available axis names."
-            subscript = "".join([axis_names[i] for i in term_axes])
-            terms.append(f"u_{{{subscript}}}")
-
-    return "$" + " ".join(terms) + "$"
-
-
 def estimate_aniso(X, y, n_neighbor=None, max_iter=100):
     """
     Estimates the expected values of beta_k^2 and s^2 under the local
@@ -604,6 +323,7 @@ def estimate_aniso(X, y, n_neighbor=None, max_iter=100):
     y_smooth = np.mean(y[neighbor_indices], axis=1)
     return s2, grad2, y_smooth
 
+
 def time_method(func):
     """The actual timer wrapper for a single function."""
     @wraps(func)
@@ -617,6 +337,7 @@ def time_method(func):
         return result
     return wrapper
 
+
 def time_all_methods(cls):
     """Class decorator to apply the timer to all methods."""
     # vars(cls) ensures we only wrap methods explicitly defined in THIS class,
@@ -626,7 +347,7 @@ def time_all_methods(cls):
             setattr(cls, attr_name, time_method(attr_value))
     return cls
 
-# --- Put this at the BOTTOM of your file ---
+
 current_module = sys.modules[__name__]
 
 # Find all functions defined in this file and wrap them
