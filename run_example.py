@@ -1,4 +1,6 @@
 import argparse
+from datetime import datetime
+import json
 import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple, Union
@@ -396,6 +398,7 @@ def run_pde_experiment(
     parser.add_argument("-q", "--quantile", type=str, default='0')
     parser.add_argument("-i", "--iteration", type=int, default=100)
     parser.add_argument("-s", "--save", type=str, default='1')
+    parser.add_argument("-o", "--output_dir", type=str, default='output', help="Directory for saving experiment CSVs")
     parser.add_argument("-d", "--debug", type=str, default='0')
     parser.add_argument("-w", "--weak_form", type=str, default='0')
     parser.add_argument("-b", "--bias_corrected", type=str, default='1')
@@ -440,7 +443,8 @@ def run_pde_experiment(
     sigma_scaled = np.std(y) * sigma_frac
 
     bc_dict = get_bc_dict(true_sol_with_derivatives, domain, boundary_conditions=boundary_conditions, **params)
-    fname = f'Bayes{pde_name}' + str(args).replace('Namespace', ' ') + '.csv'
+    args_for_name = argparse.Namespace(**{k: v for k, v in vars(args).items() if k != 'output_dir'})
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     def run_one(i):
         rng = np.random.default_rng(i)
@@ -454,8 +458,11 @@ def run_pde_experiment(
         x_test, y_test, e_test = x[index_test], y_noise[index_test], noise[index_test]
 
         if debug:
-            dataset = pd.DataFrame({'x': x_train[:, 0], 'y': x_train[:, 1], 'z': y_train})
-            dataset.to_csv(f'/Users/cheungjustin/PDE/EWA/dataset/{pde_name}.csv')
+            dataset_dir = Path("dataset")
+            dataset_dir.mkdir(parents=True, exist_ok=True)
+            dataset = pd.DataFrame(x_train, columns=variables)
+            dataset['z'] = y_train
+            dataset.to_csv(dataset_dir / f"{pde_name}.csv", index=False)
 
         model = MOD(
             dim=dim, variables=variables, domain=domain, boundary_conditions=bc_dict,
@@ -519,13 +526,33 @@ def run_pde_experiment(
     print(final_param_df.to_string(index=False, float_format=lambda x: f"{x:.4e}"))
 
     if save:
-        out_dir = Path('/Users/cheungjustin/PDE/EWA/output/')
-        if not out_dir.exists():
-            out_dir = Path('./output')
-            out_dir.mkdir(exist_ok=True)
+        out_dir = Path(args.output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
 
-        res_df.to_csv(out_dir / fname)
+        stem = f'{pde_name}_{timestamp}'
+        csv_path = out_dir / f'{stem}.csv'
+        suffix = 1
+        while csv_path.exists():
+            stem = f'{pde_name}_{timestamp}_{suffix}'
+            csv_path = out_dir / f'{stem}.csv'
+            suffix += 1
+
+        fname = csv_path.name
+        meta_fname = f'{stem}_meta.json'
+        meta_path = out_dir / meta_fname
+
+        res_df.to_csv(csv_path)
+        metadata = {
+            'pde_name': pde_name,
+            'timestamp': timestamp,
+            'output_file': fname,
+            'args': vars(args_for_name),
+        }
+        with open(meta_path, 'w', encoding='utf-8') as f:
+            json.dump(metadata, f, indent=2)
+
         print(f'{fname} written to {out_dir}')
+        print(f'{meta_fname} written to {out_dir}')
 
     t1 = time.time()
     print(f"Elapsed Time: {t1 - t0:.2f}s")
