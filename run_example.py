@@ -502,11 +502,9 @@ def run_pde_experiment(
                 true_deriv_func=true_sol_with_derivatives,
                 true_deriv_kwargs=params,
             )
-            model.plot_lambda_weight()
-            model.plot_eigenvalues()
             model.plot_basis_functions()
-            # plot_diagnostics(model, x_test, y_test, e_test, true_params, pde_name)
-            # model.plot_fit(x_test=x_test, y_test=y_test)
+            model.plot_lambda_weight()
+            plot_diagnostics(model, x_test, y_test, e_test, true_params, pde_name)
 
         return res_series
 
